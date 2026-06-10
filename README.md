@@ -1,0 +1,63 @@
+# pdf_rust
+
+依存クレートゼロ・フルスクラッチの PDF 閲覧・編集ライブラリ（Rust）。
+
+PDF のパース・シリアライズはもちろん、zlib/DEFLATE の伸長器（RFC 1950/1951 の
+inflate、固定・動的ハフマン対応）まで標準ライブラリのみで実装している。
+
+```rust
+use pdf_rust::{Document, TextOptions, StandardFont};
+
+// 読む
+let doc = Document::load("input.pdf")?;
+println!("{} ページ", doc.page_count());
+println!("{}", doc.extract_text(0)?);
+
+// 作る・編集する
+let mut doc = Document::new();
+doc.add_page(595.0, 842.0)?;  // A4
+doc.add_text(0, "Hello, PDF!", &TextOptions {
+    font: StandardFont::HelveticaBold,
+    size: 24.0, x: 72.0, y: 770.0,
+    ..Default::default()
+})?;
+doc.set_title("My Document")?;
+doc.save("output.pdf")?;
+```
+
+## 主な機能
+
+- **閲覧**: ページ列挙、テキスト抽出（ToUnicode CMap 対応）、メタデータ取得
+- **編集**: テキスト・図形の描画、ページ追加/削除/回転、メタデータ編集
+- **日本語描画**: TrueType/TTC フォント埋め込み・自動サブセット化・Identity-H（`add_text_with_font`）
+- **読み込み対応形式**: 古典 xref / クロスリファレンスストリーム /
+  オブジェクトストリーム（PDF 1.5+）/ ハイブリッド / 破損 xref の自動再構築
+- **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,
+  ASCIIHex, RunLength — すべて自前実装
+
+## 使い方
+
+```powershell
+cargo test                                        # テスト一式
+cargo run --example create_pdf                    # PDF を生成 → hello.pdf
+cargo run --example japanese_pdf                  # 日本語 PDF を生成 → japanese.pdf
+cargo run --example inspect -- hello.pdf          # 中身を表示
+cargo run --example edit_pdf -- hello.pdf out.pdf # 編集して別名保存
+cargo doc --open                                  # API ドキュメント
+```
+
+## ドキュメント
+
+- [REFERENCE.md](REFERENCE.md) — 使い方・API 一覧・PDF 形式の解説・内部設計
+- `cargo doc --open` — 全 API の rustdoc（日本語コメント付き）
+
+## 制限事項（抜粋）
+
+- 暗号化 PDF は未対応（明示的なエラーになる）
+- 保存は常に完全書き直し（増分更新ではない）
+- フォント埋め込みは TrueType（glyf アウトライン）/TTC に対応
+  （`add_text_with_font` で日本語を含む Unicode 文字を描画可能）
+- CFF アウトライン（`.otf`）は未対応。`load_font_from_bytes` がエラーを返す
+- 縦書き（Identity-V）は未対応
+
+詳細は [REFERENCE.md の §5](REFERENCE.md#5-対応機能と制限事項) を参照。

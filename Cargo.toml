@@ -1,0 +1,9 @@
+[package]
+name = "pdf_rust"
+version = "0.1.0"
+edition = "2021"
+description = "依存クレートゼロのフルスクラッチ PDF 閲覧・編集ライブラリ"
+license = "MIT"
+
+[dependencies]
+# フルスクラッチ実装のため依存なし
