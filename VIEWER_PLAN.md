@@ -136,18 +136,22 @@ Phase 1–3 と独立。並行作業可能。
 **委譲**: しおり・リンク・ページラベルは **Sonnet 可**（辞書の走査が主体）。
 位置付き抽出は **Opus 推奨**（`text.rs` の改行/空白ヒューリスティックとの整合が必要）。
 
-## Phase 5: GUI シェル — 規模: 中
+## Phase 5: GUI シェル — 規模: 中 ✅ 完了（2026-06-11、別リポジトリ）
 
-依存ゼロを貫く場合は **Win32 API を `extern "system"` の生 FFI で直接呼ぶ**
-（`CreateWindowExW` + `StretchDIBits` + メッセージループ。クレート不要）。
-代替案: 画像出力まででライブラリの責務を切る / ユーザー許可の上で windowing クレート導入。
+**別リポジトリ `../PDF_Viewer_rust` として実装済み**（Win32 生 FFI、依存は
+`pdf_rust`（path 指定）のみ。`main.rs` + `win32.rs`）。本ライブラリの責務は
+画像出力（`render_page`）までとし、GUI はビューワー側が持つ分担で確定。
 
-- [ ] ウィンドウ生成・メッセージループ・ページ描画表示
-- [ ] スクロール・ズーム・ページ送り
-- [ ] （Phase 4 連携）リンククリック・テキスト選択
+- [x] ウィンドウ生成・メッセージループ・ページ描画表示
+- [x] スクロール・ズーム・ページ送り
+- [x] （Phase 4 連携）リンク・しおり・ページラベルの利用
+- [ ] テキスト選択は未完（グリフ単位ヒットテストが必要 → Phase 8）
 
-**委譲**: **委譲非推奨**（unsafe FFI が大量で自動検証が困難。動作確認が目視必須。
-やるなら骨組みの生成のみ委譲し、統合と確認は手元で行う）。
+ビューワー実装で判明したライブラリ側の不足は
+`../PDF_Viewer_rust/MISSING_FEATURES.md` に棚卸し済み。その内容を
+Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に取り込んだ。
+
+**委譲**: **委譲非推奨**（unsafe FFI が大量で自動検証が困難。動作確認が目視必須）。
 
 ## Phase 6: 実世界カバレッジ拡大 — 規模: 特大・継続的
 
@@ -160,15 +164,85 @@ Phase 1–3 と独立。並行作業可能。
 - [ ] シェーディング（`sh`、axial/radial）・タイリングパターン
 - [ ] 透明度（ExtGState `CA`/`ca`、ブレンドモード、透明グループ）
 - [ ] CCITTFaxDecode / JBIG2（スキャン文書）。JPXDecode はスコープ外も妥当
+- [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
+- [ ] `/Mask`（ステンシル・カラーキー）
+- [ ] 縦書き（Identity-V。和文ビューワーとしては将来必要）
 
 **委譲**: 暗号プリミティブ（MD5/SHA/RC4/AES 単体）は **Sonnet 可**
 （公式テストベクタで完全検証できる）。セキュリティハンドラ統合・CFF・
 透明度は **Opus 推奨**。シェーディング・CCITT は **Opus 可**。
 
+## Phase 7: レンダリング性能・制御 — 規模: 中（ビューワー体感に直結・最優先）
+
+出典: `../PDF_Viewer_rust/MISSING_FEATURES.md` §1・§4・§5。ズーム/パンの全面
+再描画と GUI スレッドのブロックが現状の最大の体感問題。Phase 6/8 と独立。
+
+中心は `RenderOptions` の導入（`render_page(index, scale)` は薄いラッパとして維持）:
+
+```rust
+pub struct RenderOptions {
+    pub scale: f64,                      // 72dpi = 1.0（既定 1.0）
+    pub region: Option<[f64; 4]>,        // デバイス px [x, y, w, h]。None = 全面
+    pub cancel: Option<Arc<AtomicBool>>, // true で協調キャンセル
+    pub annotations: bool,               // 注釈外観の描画（既定 true）
+    pub quality: RenderQuality,          // Normal / Fast（サムネイル用）
+}
+doc.render_page_with(index, &RenderOptions) -> Result<Pixmap>
+doc.render_page_into(index, &RenderOptions, &mut Pixmap) -> Result<()>  // バッファ再利用
+doc.page_size(index) -> Result<(f64, f64)>  // /Rotate 反映済み論理サイズ（pt）
+```
+
+- [ ] 領域（タイル）レンダリング: 基底 CTM に `translate(-x, -y)` を合成して
+      region サイズの Pixmap に描く。**全面レンダ結果の切り出しとのピクセル一致**で検証。
+      （演算列は全件解釈する。範囲外はラスタライザのクリップで落ちる設計。
+      演算単位のカリングは効果測定後の追加最適化とする）
+- [ ] 協調キャンセル: `Renderer` の演算ループ N 件ごと + 画像デコード・グリフ描画の
+      内周にチェックを挿入。`PdfError::Cancelled` を追加し、部分結果は返さず `Err`
+- [ ] `render_page_into`: 既存 `Pixmap` の再利用（サイズ不一致は内部で作り直し）
+- [ ] 注釈描画の ON/OFF（`annotations: false` で /AP をスキップ）
+- [ ] `quality: Fast`: AA の縦サブスキャン 4x→1x・画像補間を最近傍に切替
+      （サムネイル・先読み用。画質劣化は許容と明記）
+- [ ] `page_size(index)` / DPI 換算ヘルパ（`dpi / 72.0` の指針を rustdoc に明記）
+
+**委譲**: 領域レンダリング・`render_page_into`・`page_size` は **Sonnet 可**
+（ピクセル等価テストで機械検証できる）。キャンセル挿入と `RenderOptions` の
+API 統合は **Opus 可**（チェック粒度と既存 API との整合に裁量）。
+
+## Phase 8: テキスト検索・選択 API — 規模: 中
+
+出典: `../PDF_Viewer_rust/MISSING_FEATURES.md` §2。ビューワーの Ctrl+F と
+テキスト選択（キャレット・ドラッグ）に必要。Phase 7 と独立・並行可能。
+
+- [ ] グリフ単位ボックス: `TextSpan` に `glyphs: Vec<SpanGlyph { text, bbox }>` を追加
+      （スパン抽出の状態機械はコード単位で advance を持っているので、コードごとの
+      原点を記録して bbox 化する。既存フィールドは不変 = ビューワー側の互換を維持）
+- [ ] 検索 API:
+      `doc.search_page(index, query, &SearchOptions) -> Vec<SearchHit { rects }>` と
+      全ページ版 `doc.search(query, ..) -> Vec<(usize, SearchHit)>`。
+      `SearchOptions { case_insensitive: bool }` から開始（正規表現はスコープ外）
+- [ ] スパン跨ぎマッチ: 同一行判定（ベースライン y 差が実効サイズの一定割合以内）で
+      隣接スパンを連結し、行を跨ぐヒットはスパン境界に空白 1 個を仮定して照合。
+      ヒットの矩形は行ごとにマージして `rects` に分割する
+- [ ] （選択支援）`SearchHit`/グリフボックスだけで足りるかビューワー側で検証し、
+      必要ならヒットテストヘルパ `span/glyph_at(point)` を追加
+
+**委譲**: グリフ単位ボックスは **Opus 推奨**（`text.rs` のスパン状態機械の拡張。
+Tz/Tc/Tw/TJ 調整の境界処理に裁量）。検索・行マージは **Opus 可**
+（照合自体は単純だが跨ぎ判定のヒューリスティック設計を含む）。
+
 ---
 
 ## 推奨経路
 
-最短で「動くビューワー」: **Phase 1 → 2 → 5**（テキスト中心 PDF で実用化）。
-画像（Phase 3）とビューワー機能（Phase 4）は後付け・並行可能。
-最大のコスト要因は JPEG デコーダと CFF インタプリタの自前実装。
+~~最短で「動くビューワー」: Phase 1 → 2 → 5~~ → **達成済み**（Phase 1–5 完了。
+ビューワーは `../PDF_Viewer_rust` で稼働中）。
+
+次に効く順（`MISSING_FEATURES.md` の提案どおり）:
+
+1. **Phase 7**（領域レンダリング・キャンセル）— ズーム/パンの体感と GUI の応答性
+2. **Phase 8**（検索・選択）— Ctrl+F とテキスト選択の実現
+3. **Phase 6**（実 PDF カバレッジ）— CFF → 暗号化（空パスワード優先）→
+   シェーディング → 透明度 → CCITT の順。表示できない実例ドリブンで進める
+
+Phase 7 と 8 は互いに独立で並行可能。Phase 6 は粒度が大きいので、着手時に
+「CFF だけ」「暗号化だけ」を 1 単位として切り出す。
