@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["decode_text_string","encode_text_string"],"struct":["Document","DrawOptions","TextOptions"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Token"],"fn":["is_delimiter","is_regular","is_whitespace"],"struct":["Lexer"]};

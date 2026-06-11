@@ -125,6 +125,9 @@ impl<'a> Lexer<'a> {
                     self.pos += 2;
                     Ok(Token::DictEnd)
                 } else {
+                    // 1 バイト読み捨ててからエラーを返す（呼び出し側が
+                    // エラーを読み飛ばしても必ず前進するように）
+                    self.pos += 1;
                     Err(self.syntax("unexpected '>'"))
                 }
             }
@@ -142,7 +145,11 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 Ok(Token::Keyword((b as char).to_string()))
             }
-            b')' => Err(self.syntax("unexpected ')'")),
+            b')' => {
+                // 対応の取れない閉じ括弧も 1 バイト読み捨ててからエラーを返す
+                self.pos += 1;
+                Err(self.syntax("unexpected ')'"))
+            }
             _ => self.read_keyword(),
         }
     }
@@ -187,10 +194,9 @@ impl<'a> Lexer<'a> {
     fn read_literal_string(&mut self) -> Result<Token> {
         let mut out = Vec::new();
         let mut depth = 1usize; // 対応の取れた括弧はエスケープ不要（§7.3.4.2）
-        loop {
-            let b = self
-                .peek_byte()
-                .ok_or_else(|| self.syntax("unterminated string"))?;
+
+        // 未終端の文字列は EOF で閉じたものとして扱う（耐故障性）
+        while let Some(b) = self.peek_byte() {
             self.pos += 1;
             match b {
                 b'(' => {
@@ -205,9 +211,11 @@ impl<'a> Lexer<'a> {
                     out.push(b);
                 }
                 b'\\' => {
-                    let e = self
-                        .peek_byte()
-                        .ok_or_else(|| self.syntax("unterminated string"))?;
+                    let e = match self.peek_byte() {
+                        Some(e) => e,
+                        // 末尾が \ で終わる未終端文字列も EOF で打ち切る
+                        None => break,
+                    };
                     self.pos += 1;
                     match e {
                         b'n' => out.push(b'\n'),
@@ -443,6 +451,23 @@ mod tests {
                 Token::Name("Type".into()),
             ]
         );
+    }
+
+    #[test]
+    fn unterminated_literal_string_ends_at_eof() {
+        // 未終端文字列は EOF で閉じたものとして部分文字列を返す
+        assert_eq!(tokens(b"(abc"), vec![Token::LiteralString(b"abc".to_vec())]);
+        // 末尾がバックスラッシュでも同様
+        assert_eq!(tokens(b"(ab\\"), vec![Token::LiteralString(b"ab".to_vec())]);
+    }
+
+    #[test]
+    fn error_tokens_consume_at_least_one_byte() {
+        // エラーを返す場合も必ず位置が前進する（読み飛ばしループの無限化防止）
+        let mut lex = Lexer::new(b") >");
+        assert!(lex.next_token().is_err());
+        assert!(lex.next_token().is_err());
+        assert_eq!(lex.next_token().unwrap(), Token::Eof);
     }
 
     #[test]

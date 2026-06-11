@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["StandardFont"],"fn":["char_to_winansi","winansi_to_char"]};

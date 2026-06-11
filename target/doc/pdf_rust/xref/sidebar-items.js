@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["XrefEntry"],"fn":["find_startxref","reconstruct"],"struct":["Xref"]};

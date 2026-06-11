@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Object","StringFormat"],"struct":["Dictionary","Stream"],"type":["ObjectId"]};

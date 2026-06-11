@@ -46,8 +46,12 @@
 //! | [`xref`] | 相互参照テーブル（古典 / xref ストリーム / 再構築） |
 //! | [`filters`] | ストリームフィルタ（Flate, LZW, ASCII85, RunLength…） |
 //! | [`content`] | コンテントストリームの解析・生成 |
+//! | [`function`] | PDF 関数インタプリタ（Type 0/2/3/4） |
 //! | [`text`] | テキスト抽出（ToUnicode CMap 対応） |
 //! | [`font`] | 標準 14 フォントのメトリクスと WinAnsi 変換 |
+//! | [`encoding`] | 単純フォントのエンコーディング解決（Standard/MacRoman/グリフ名） |
+//! | [`truetype`] / [`subset`] | TrueType パーサ（glyf アウトライン込み）とサブセッタ |
+//! | [`render`] | ラスタライザ（ベクタ図形 + TrueType テキスト描画 → [`Pixmap`]） |
 //! | [`writer`] | シリアライザ（保存処理の実体） |
 //!
 //! ## 制限事項
@@ -56,16 +60,25 @@
 //! - 保存は常に完全書き直し（増分更新・電子署名の保持は不可）
 //! - テキスト抽出は ToUnicode CMap か WinAnsi 相当の単純フォントが対象。
 //!   ToUnicode を持たない CID フォントや `/Differences` は近似になる
-//! - 画像のデコード（DCT/JPX など）は行わない（生データの取得は可能）
+//! - 画像コーデックのうち JPEG（DCTDecode baseline）はデコード対応。
+//!   JPX/CCITTFax/JBIG2 と progressive JPEG は未対応（生データの取得は可能）
+//! - レンダリングは画像 XObject・インライン画像を描画する（BitsPerComponent
+//!   1/2/4/8/16、/Decode、ImageMask、SMask、各種色空間、baseline JPEG）。
+//!   /Mask（ステンシル・カラーキー）・シェーディング・透明度（ブレンドモード・
+//!   透明グループ）は未対応。CFF/Type1 のテキストはシステムフォント代替で
+//!   近似描画する
 
 pub mod content;
 pub mod document;
+pub mod encoding;
 pub mod error;
 pub mod filters;
 pub mod font;
+pub mod function;
 pub mod lexer;
 pub mod object;
 pub mod parser;
+pub mod render;
 pub mod subset;
 pub mod text;
 pub mod truetype;
@@ -79,4 +92,5 @@ pub use document::{
 pub use error::{PdfError, Result};
 pub use font::StandardFont;
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
+pub use render::Pixmap;
 pub use truetype::TrueTypeFont;

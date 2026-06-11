@@ -19,7 +19,10 @@ use crate::lexer::{Lexer, Token};
 use crate::object::{Dictionary, Object, ObjectId};
 
 /// フォントの文字幅情報（空白検出のための advance 計算に使う）。
-enum WidthSource {
+///
+/// テキスト抽出（本モジュール）と描画（[`crate::render`]）で共有するため
+/// `pub(crate)` で公開する。レンダラはこの幅情報を字送り（w0）の決定に使う。
+pub(crate) enum WidthSource {
     /// 単純フォント: `/FirstChar` + `/Widths`
     Simple { first_char: u32, widths: Vec<f64> },
     /// CID フォント: `/DW`（既定幅）+ `/W` から作ったマップ
@@ -31,6 +34,30 @@ enum WidthSource {
     Standard(crate::font::StandardFont),
     /// 不明（advance 計算ができない）
     Unknown,
+}
+
+impl WidthSource {
+    /// フォント辞書から文字幅情報を構築する（抽出・描画の共通入口）。
+    ///
+    /// `two_byte` は Type0/CID フォント（2 バイトコード）かどうか。
+    pub(crate) fn from_font_dict(doc: &Document, font: &Dictionary, two_byte: bool) -> WidthSource {
+        FontDecoder::load_widths(doc, font, two_byte)
+    }
+
+    /// 文字コードの幅（1000 分の 1 em 単位）。不明なら `None`。
+    pub(crate) fn width_of(&self, code: u32) -> Option<f64> {
+        match self {
+            WidthSource::Simple { first_char, widths } => {
+                let idx = code.checked_sub(*first_char)? as usize;
+                widths.get(idx).copied()
+            }
+            WidthSource::Cid { default, map } => Some(*map.get(&code).unwrap_or(default)),
+            WidthSource::Standard(f) => {
+                Some(f.char_width(crate::font::winansi_to_char(code as u8)) as f64)
+            }
+            WidthSource::Unknown => None,
+        }
+    }
 }
 
 /// 1 フォント分のデコード情報。
@@ -72,7 +99,7 @@ impl FontDecoder {
         }
     }
 
-    fn load_widths(doc: &Document, font: &Dictionary, two_byte: bool) -> WidthSource {
+    pub(crate) fn load_widths(doc: &Document, font: &Dictionary, two_byte: bool) -> WidthSource {
         if two_byte {
             // Type0: /DescendantFonts [0] に CID フォントの幅がある
             let desc = doc
@@ -134,35 +161,12 @@ impl FontDecoder {
 
     /// 文字コードの幅（1000 分の 1 em 単位）。不明なら `None`。
     fn code_width(&self, code: u32) -> Option<f64> {
-        match &self.widths {
-            WidthSource::Simple { first_char, widths } => {
-                let idx = code.checked_sub(*first_char)? as usize;
-                widths.get(idx).copied()
-            }
-            WidthSource::Cid { default, map } => Some(*map.get(&code).unwrap_or(default)),
-            WidthSource::Standard(f) => {
-                Some(f.char_width(crate::font::winansi_to_char(code as u8)) as f64)
-            }
-            WidthSource::Unknown => None,
-        }
+        self.widths.width_of(code)
     }
 
     /// バイト列をコード列に分解する。
     fn codes(&self, bytes: &[u8]) -> Vec<u32> {
-        if self.two_byte {
-            bytes
-                .chunks(2)
-                .map(|p| {
-                    if p.len() == 2 {
-                        u16::from_be_bytes([p[0], p[1]]) as u32
-                    } else {
-                        p[0] as u32
-                    }
-                })
-                .collect()
-        } else {
-            bytes.iter().map(|&b| b as u32).collect()
-        }
+        split_codes(bytes, self.two_byte)
     }
 
     /// 表示文字列のバイト列を Unicode 文字列へ変換する。
@@ -183,6 +187,28 @@ impl FontDecoder {
             total += self.code_width(code)?;
         }
         Some(total)
+    }
+}
+
+/// 表示文字列のバイト列をコード列へ分解する（抽出・描画の共通ヘルパ）。
+///
+/// `two_byte` が真なら 2 バイト big-endian（Type0/CID）として、偽なら
+/// 1 バイトずつコードへ分解する。末尾が奇数の場合は最後の 1 バイトを
+/// そのままコードとして扱う（耐故障性）。
+pub(crate) fn split_codes(bytes: &[u8], two_byte: bool) -> Vec<u32> {
+    if two_byte {
+        bytes
+            .chunks(2)
+            .map(|p| {
+                if p.len() == 2 {
+                    u16::from_be_bytes([p[0], p[1]]) as u32
+                } else {
+                    p[0] as u32
+                }
+            })
+            .collect()
+    } else {
+        bytes.iter().map(|&b| b as u32).collect()
     }
 }
 
@@ -473,10 +499,20 @@ fn parse_tounicode_cmap(data: &[u8]) -> HashMap<u32, String> {
     // 直近のオペランドを溜めるスタック
     let mut stack: Vec<Token> = Vec::new();
     loop {
+        let before = lexer.pos;
         let token = match lexer.next_token() {
             Ok(Token::Eof) => break,
             Ok(t) => t,
-            Err(_) => continue,
+            Err(_) => {
+                // 位置が進まないエラー（未終端文字列など）での無限ループを防ぐ
+                if lexer.pos <= before {
+                    if before >= data.len() {
+                        break;
+                    }
+                    lexer.pos = before + 1;
+                }
+                continue;
+            }
         };
         match &token {
             Token::Keyword(k) if k == "beginbfchar" => {
@@ -590,6 +626,13 @@ endcmap end end";
         assert_eq!(map[&0x50], "p");
         assert_eq!(map[&0x51], "q");
         assert_eq!(map[&0x52], "r");
+    }
+
+    /// 未終端文字列を含む壊れた CMap で無限ループしない（回帰テスト）。
+    #[test]
+    fn broken_cmap_terminates() {
+        parse_tounicode_cmap(b"1 beginbfchar <0041> (never closed");
+        parse_tounicode_cmap(b"<48656");
     }
 
     #[test]

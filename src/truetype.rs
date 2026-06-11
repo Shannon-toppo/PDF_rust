@@ -22,6 +22,7 @@ use crate::error::{PdfError, Result};
 ///
 /// TTC の場合もファイル全体のバイト列を保持し、テーブルディレクトリだけ
 /// 選択した書体のものを使う（テーブルオフセットはファイル先頭基準）。
+#[derive(Clone)]
 pub struct TrueTypeFont {
     /// ファイル全体のバイト列。
     data: Vec<u8>,
@@ -44,9 +45,35 @@ pub struct TrueTypeFont {
     loca: Vec<u32>,
     /// cmap の解析結果（実装の都合で内部表現は自由に変えてよい）。
     cmap: Cmap,
+    /// シンボリックフォント向けの cmap。
+    /// (3,0) の format 4/0、または (1,0) の format 0 を保持する。
+    /// 無ければ [`Cmap::None`]。
+    symbolic_cmap: Cmap,
+}
+
+/// グリフアウトラインの 1 セグメント。座標はフォント単位（y 上向き）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutlineSegment {
+    /// 新しい輪郭の開始点へ移動。
+    MoveTo(f64, f64),
+    /// 直線。
+    LineTo(f64, f64),
+    /// 2 次ベジェ（制御点 x,y と終点 x,y）。
+    QuadTo(f64, f64, f64, f64),
+    /// 輪郭を閉じる。
+    Close,
+}
+
+/// 単純グリフの座標 1 点（累積座標化済み）。
+#[derive(Clone, Copy)]
+struct GlyphPoint {
+    x: f64,
+    y: f64,
+    on_curve: bool,
 }
 
 /// cmap サブテーブルの内部表現。
+#[derive(Clone)]
 enum Cmap {
     /// format 4: BMP のセグメント配列（binary search で引く）。
     Format4 {
@@ -59,10 +86,13 @@ enum Cmap {
     },
     /// format 12: SequentialMapGroup の配列。
     Format12 { groups: Vec<(u32, u32, u32)> }, // (startChar, endChar, startGID)
+    /// format 0: 256 バイトの glyphIdArray（バイトコード → GID）。
+    Format0 { glyph_id_array: Vec<u8> },
     /// 使える cmap が無い。
     None,
 }
 
+#[derive(Clone)]
 struct Format4Segment {
     end_code: u16,
     start_code: u16,
@@ -296,6 +326,8 @@ impl TrueTypeFont {
 
         // 10. cmap。
         let cmap = parse_cmap(&data, &tables);
+        // シンボリックフォント向けの cmap も別途解析する。
+        let symbolic_cmap = parse_symbolic_cmap(&data, &tables);
 
         Ok(TrueTypeFont {
             data,
@@ -312,6 +344,7 @@ impl TrueTypeFont {
             post_script_name,
             loca,
             cmap,
+            symbolic_cmap,
         })
     }
 
@@ -368,73 +401,32 @@ impl TrueTypeFont {
 
     /// Unicode 文字 → グリフ ID。マップに無ければ `None`。
     pub fn glyph_id(&self, c: char) -> Option<u16> {
-        let code = c as u32;
-        match &self.cmap {
-            Cmap::Format12 { groups } => {
-                // groups は startCharCode 昇順前提。binary search。
-                let mut lo = 0usize;
-                let mut hi = groups.len();
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let (start, end, start_gid) = groups[mid];
-                    if code < start {
-                        hi = mid;
-                    } else if code > end {
-                        lo = mid + 1;
-                    } else {
-                        // gid = startGlyphID + (c - startCharCode)。
-                        let gid = start_gid.wrapping_add(code - start);
-                        // u16 範囲超過 or 0 は None。
-                        if gid == 0 || gid > u16::MAX as u32 {
-                            return None;
-                        }
-                        return Some(gid as u16);
-                    }
-                }
-                None
-            }
-            Cmap::Format4 { segments, subtable } => {
-                if code > 0xFFFF {
-                    return None;
-                }
-                let c16 = code as u16;
-                // endCode >= c の最初の segment を探す（segments は endCode 昇順）。
-                let mut lo = 0usize;
-                let mut hi = segments.len();
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if segments[mid].end_code < c16 {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                let seg = segments.get(lo)?;
-                if c16 < seg.start_code {
-                    return None;
-                }
-                let gid: u16 = if seg.id_range_offset == 0 {
-                    ((c16 as i32 + seg.id_delta as i32) & 0xFFFF) as u16
-                } else {
-                    // address = range_offset_pos + idRangeOffset + 2*(c - startCode)。
-                    let addr = seg
-                        .range_offset_pos
-                        .checked_add(seg.id_range_offset as usize)?
-                        .checked_add(2 * (c16 - seg.start_code) as usize)?;
-                    let glyph = read_u16(subtable, addr)?;
-                    if glyph == 0 {
-                        return None;
-                    }
-                    ((glyph as i32 + seg.id_delta as i32) & 0xFFFF) as u16
-                };
-                if gid == 0 {
-                    None
-                } else {
-                    Some(gid)
-                }
-            }
-            Cmap::None => None,
+        lookup(&self.cmap, c as u32)
+    }
+
+    /// シンボリックフォント向け: 文字コードからグリフ ID を引く。
+    /// (3,0)/(1,0) cmap を code → 0xF000+code の順で試し、
+    /// 無ければ通常の Unicode cmap でも試す。
+    pub fn glyph_id_by_code(&self, code: u32) -> Option<u16> {
+        // 1. シンボリック cmap を code → 0xF000+code の順で試す。
+        if let Some(gid) = lookup(&self.symbolic_cmap, code) {
+            return Some(gid);
         }
+        if code <= 0xFF {
+            if let Some(gid) = lookup(&self.symbolic_cmap, 0xF000 + code) {
+                return Some(gid);
+            }
+        }
+        // 2. 通常の Unicode cmap でも同様に試す。
+        if let Some(gid) = lookup(&self.cmap, code) {
+            return Some(gid);
+        }
+        if code <= 0xFF {
+            if let Some(gid) = lookup(&self.cmap, 0xF000 + code) {
+                return Some(gid);
+            }
+        }
+        None
     }
 
     /// グリフの advance 幅（フォント単位）。
@@ -481,6 +473,134 @@ impl TrueTypeFont {
         }
         let end = end.min(glyf.len());
         glyf.get(start..end)
+    }
+
+    /// グリフのアウトラインをデコードする。
+    /// 空グリフは `Some(vec![])`、gid 範囲外・glyf 無し・データ不正は `None`。
+    ///
+    /// 座標はフォント単位（y 上向き）。composite グリフは子を再帰展開して
+    /// 変換を適用する（再帰深さ上限 5、コンポーネント数上限 64）。
+    pub fn glyph_outline(&self, gid: u16) -> Option<Vec<OutlineSegment>> {
+        self.glyph_outline_depth(gid, 0)
+    }
+
+    /// `glyph_outline` の本体。`depth` は composite 再帰の深さ。
+    fn glyph_outline_depth(&self, gid: u16, depth: usize) -> Option<Vec<OutlineSegment>> {
+        // 再帰深さ上限（循環参照対策）。
+        if depth > 5 {
+            return None;
+        }
+        let data = self.glyph_data(gid)?;
+        // 空グリフ（スペース等）。
+        if data.is_empty() {
+            return Some(Vec::new());
+        }
+        // numberOfContours @0。
+        let num_contours = read_i16(data, 0)?;
+        if num_contours >= 0 {
+            decode_simple_glyph(data, num_contours as usize)
+        } else {
+            self.decode_composite_glyph(data, depth)
+        }
+    }
+
+    /// composite グリフをデコードする。
+    fn decode_composite_glyph(&self, data: &[u8], depth: usize) -> Option<Vec<OutlineSegment>> {
+        let mut out: Vec<OutlineSegment> = Vec::new();
+        // ヘッダ 10 バイトの後からコンポーネントレコード。
+        let mut pos = 10usize;
+        let mut component_count = 0usize;
+        loop {
+            // コンポーネント数の上限。
+            component_count += 1;
+            if component_count > 64 {
+                return None;
+            }
+            let flags = read_u16(data, pos)?;
+            let glyph_index = read_u16(data, pos + 2)?;
+            pos = pos.checked_add(4)?;
+
+            // 引数: WORDS なら i16×2、でなければ i8×2。
+            let args_are_words = flags & 0x0001 != 0;
+            let args_are_xy = flags & 0x0002 != 0;
+            let (dx, dy) = if args_are_words {
+                let a1 = read_i16(data, pos)?;
+                let a2 = read_i16(data, pos + 2)?;
+                pos = pos.checked_add(4)?;
+                if args_are_xy {
+                    (a1 as f64, a2 as f64)
+                } else {
+                    // 点合わせ方式（稀）。オフセット 0 として扱う。
+                    (0.0, 0.0)
+                }
+            } else {
+                let a1 = *data.get(pos)? as i8;
+                let a2 = *data.get(pos + 1)? as i8;
+                pos = pos.checked_add(2)?;
+                if args_are_xy {
+                    (a1 as f64, a2 as f64)
+                } else {
+                    (0.0, 0.0)
+                }
+            };
+
+            // 変換行列 a,b,c,d。
+            let (mut a, mut b, mut c, mut d) = (1.0_f64, 0.0_f64, 0.0_f64, 1.0_f64);
+            if flags & 0x0008 != 0 {
+                // WE_HAVE_A_SCALE: F2Dot14 1 個（a=d=s）。
+                let s = read_f2dot14(data, pos)?;
+                pos = pos.checked_add(2)?;
+                a = s;
+                d = s;
+            } else if flags & 0x0040 != 0 {
+                // X_AND_Y_SCALE: F2Dot14 2 個。
+                a = read_f2dot14(data, pos)?;
+                d = read_f2dot14(data, pos + 2)?;
+                pos = pos.checked_add(4)?;
+            } else if flags & 0x0080 != 0 {
+                // TWO_BY_TWO: F2Dot14 4 個（a,b,c,d）。
+                a = read_f2dot14(data, pos)?;
+                b = read_f2dot14(data, pos + 2)?;
+                c = read_f2dot14(data, pos + 4)?;
+                d = read_f2dot14(data, pos + 6)?;
+                pos = pos.checked_add(8)?;
+            }
+
+            // 子グリフを再帰デコードして変換を適用。
+            if let Some(child) = self.glyph_outline_depth(glyph_index, depth + 1) {
+                for seg in child {
+                    // 子の点 (x,y) → (a·x + c·y + dx, b·x + d·y + dy)。
+                    let tf = |x: f64, y: f64| (a * x + c * y + dx, b * x + d * y + dy);
+                    out.push(match seg {
+                        OutlineSegment::MoveTo(x, y) => {
+                            let (nx, ny) = tf(x, y);
+                            OutlineSegment::MoveTo(nx, ny)
+                        }
+                        OutlineSegment::LineTo(x, y) => {
+                            let (nx, ny) = tf(x, y);
+                            OutlineSegment::LineTo(nx, ny)
+                        }
+                        OutlineSegment::QuadTo(cx, cy, ex, ey) => {
+                            let (ncx, ncy) = tf(cx, cy);
+                            let (nex, ney) = tf(ex, ey);
+                            OutlineSegment::QuadTo(ncx, ncy, nex, ney)
+                        }
+                        OutlineSegment::Close => OutlineSegment::Close,
+                    });
+                }
+            }
+
+            // 入れ子 composite による指数的膨張のガード。
+            if out.len() > MAX_COMPOSITE_SEGMENTS {
+                return None;
+            }
+
+            // MORE_COMPONENTS が立っていなければ終了。
+            if flags & 0x0020 == 0 {
+                break;
+            }
+        }
+        Some(out)
     }
 }
 
@@ -635,6 +755,89 @@ fn parse_loca(
         }
     }
     out
+}
+
+/// 解析済み [`Cmap`] から文字コード → グリフ ID を引く内部関数。
+/// `glyph_id` / `glyph_id_by_code` の共通ロジック（外部挙動は不変）。
+fn lookup(cmap: &Cmap, code: u32) -> Option<u16> {
+    match cmap {
+        Cmap::Format12 { groups } => {
+            // groups は startCharCode 昇順前提。binary search。
+            let mut lo = 0usize;
+            let mut hi = groups.len();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let (start, end, start_gid) = groups[mid];
+                if code < start {
+                    hi = mid;
+                } else if code > end {
+                    lo = mid + 1;
+                } else {
+                    // gid = startGlyphID + (c - startCharCode)。
+                    let gid = start_gid.wrapping_add(code - start);
+                    // u16 範囲超過 or 0 は None。
+                    if gid == 0 || gid > u16::MAX as u32 {
+                        return None;
+                    }
+                    return Some(gid as u16);
+                }
+            }
+            None
+        }
+        Cmap::Format4 { segments, subtable } => {
+            if code > 0xFFFF {
+                return None;
+            }
+            let c16 = code as u16;
+            // endCode >= c の最初の segment を探す（segments は endCode 昇順）。
+            let mut lo = 0usize;
+            let mut hi = segments.len();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if segments[mid].end_code < c16 {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let seg = segments.get(lo)?;
+            if c16 < seg.start_code {
+                return None;
+            }
+            let gid: u16 = if seg.id_range_offset == 0 {
+                ((c16 as i32 + seg.id_delta as i32) & 0xFFFF) as u16
+            } else {
+                // address = range_offset_pos + idRangeOffset + 2*(c - startCode)。
+                let addr = seg
+                    .range_offset_pos
+                    .checked_add(seg.id_range_offset as usize)?
+                    .checked_add(2 * (c16 - seg.start_code) as usize)?;
+                let glyph = read_u16(subtable, addr)?;
+                if glyph == 0 {
+                    return None;
+                }
+                ((glyph as i32 + seg.id_delta as i32) & 0xFFFF) as u16
+            };
+            if gid == 0 {
+                None
+            } else {
+                Some(gid)
+            }
+        }
+        Cmap::Format0 { glyph_id_array } => {
+            // 256 バイトの直接マップ。範囲外コードは None。
+            if code > 0xFF {
+                return None;
+            }
+            let gid = *glyph_id_array.get(code as usize)?;
+            if gid == 0 {
+                None
+            } else {
+                Some(gid as u16)
+            }
+        }
+        Cmap::None => None,
+    }
 }
 
 /// `cmap` テーブルを解析し、優先順に 1 つのサブテーブルを選ぶ。
@@ -813,6 +1016,89 @@ fn parse_cmap_format4(cmap: &[u8], sub_off: usize) -> Cmap {
     Cmap::Format4 { segments, subtable }
 }
 
+/// シンボリックフォント向けの cmap を解析する。
+/// (3,0) の format 4/0、または (1,0) の format 0 を優先順に 1 つ選ぶ。
+fn parse_symbolic_cmap(
+    data: &[u8],
+    tables: &std::collections::HashMap<[u8; 4], (usize, usize)>,
+) -> Cmap {
+    let Some((cmap_off, cmap_len)) = tables.get(b"cmap").copied() else {
+        return Cmap::None;
+    };
+    let Some(cmap) = data.get(cmap_off..cmap_off + cmap_len) else {
+        return Cmap::None;
+    };
+    let Some(num_sub) = read_u16(cmap, 2) else {
+        return Cmap::None;
+    };
+
+    // 優先度（小さいほど優先）: 0=(3,0) f4, 1=(3,0) f0, 2=(1,0) f0。
+    let mut best: Option<(u8, usize, u16)> = None; // (priority, sub_offset, format)
+
+    for i in 0..num_sub as usize {
+        let rec = match 4usize.checked_add(i.saturating_mul(8)) {
+            Some(v) => v,
+            None => break,
+        };
+        let Some(platform_id) = read_u16(cmap, rec) else {
+            break;
+        };
+        let Some(encoding_id) = read_u16(cmap, rec + 2) else {
+            break;
+        };
+        let Some(sub_off) = read_u32(cmap, rec + 4) else {
+            break;
+        };
+        let sub_off = sub_off as usize;
+        let Some(format) = read_u16(cmap, sub_off) else {
+            continue;
+        };
+
+        let priority: Option<u8> = match (platform_id, encoding_id, format) {
+            (3, 0, 4) => Some(0),
+            (3, 0, 0) => Some(1),
+            (1, 0, 0) => Some(2),
+            _ => None,
+        };
+
+        if let Some(p) = priority {
+            let better = match best {
+                Some((bp, _, _)) => p < bp,
+                None => true,
+            };
+            if better {
+                best = Some((p, sub_off, format));
+            }
+        }
+    }
+
+    let Some((_, sub_off, format)) = best else {
+        return Cmap::None;
+    };
+
+    match format {
+        4 => parse_cmap_format4(cmap, sub_off),
+        0 => parse_cmap_format0(cmap, sub_off),
+        _ => Cmap::None,
+    }
+}
+
+/// cmap format 0 を解析する。
+/// u16 format=0, u16 length, u16 language, u8 glyphIdArray[256]。
+fn parse_cmap_format0(cmap: &[u8], sub_off: usize) -> Cmap {
+    // glyphIdArray は sub_off + 6 から 256 バイト。
+    let base = match sub_off.checked_add(6) {
+        Some(v) => v,
+        None => return Cmap::None,
+    };
+    let Some(arr) = cmap.get(base..base + 256) else {
+        return Cmap::None;
+    };
+    Cmap::Format0 {
+        glyph_id_array: arr.to_vec(),
+    }
+}
+
 impl std::fmt::Debug for TrueTypeFont {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TrueTypeFont")
@@ -826,6 +1112,203 @@ impl std::fmt::Debug for TrueTypeFont {
 /// `PdfError::Font` を作る補助。
 pub(crate) fn font_err(msg: impl Into<String>) -> PdfError {
     PdfError::Font(msg.into())
+}
+
+/// `data[pos..pos+2]` を F2Dot14（i16 / 16384.0）として読む。範囲外は `None`。
+fn read_f2dot14(data: &[u8], pos: usize) -> Option<f64> {
+    read_i16(data, pos).map(|v| v as f64 / 16384.0)
+}
+
+/// 単純グリフのデコード上限（信頼できない入力対策）。
+const MAX_GLYPH_POINTS: usize = 10000;
+const MAX_GLYPH_CONTOURS: usize = 1000;
+/// composite 展開後の総セグメント数上限（深い入れ子による指数的膨張の対策）。
+const MAX_COMPOSITE_SEGMENTS: usize = 100_000;
+
+/// 単純グリフ（numberOfContours >= 0）をデコードする。
+fn decode_simple_glyph(data: &[u8], num_contours: usize) -> Option<Vec<OutlineSegment>> {
+    if num_contours == 0 {
+        return Some(Vec::new());
+    }
+    if num_contours > MAX_GLYPH_CONTOURS {
+        return None;
+    }
+    // ヘッダ 10 バイトの後 endPtsOfContours: u16 × numContours。
+    let mut pos = 10usize;
+    let mut end_pts = Vec::with_capacity(num_contours);
+    for _ in 0..num_contours {
+        let e = read_u16(data, pos)?;
+        end_pts.push(e);
+        pos = pos.checked_add(2)?;
+    }
+    // 点数 = 最後の endPt + 1。endPts は昇順前提だが念のため最大を取る。
+    let last = *end_pts.iter().max()?;
+    let num_points = (last as usize).checked_add(1)?;
+    if num_points > MAX_GLYPH_POINTS {
+        return None;
+    }
+
+    // instructionLength u16 と instructions（読み飛ばす）。
+    let instr_len = read_u16(data, pos)? as usize;
+    pos = pos.checked_add(2)?;
+    pos = pos.checked_add(instr_len)?;
+
+    // フラグ列（REPEAT 展開しながら num_points 個読む）。
+    let mut flags = Vec::with_capacity(num_points);
+    while flags.len() < num_points {
+        let f = *data.get(pos)?;
+        pos = pos.checked_add(1)?;
+        flags.push(f);
+        if f & 0x08 != 0 {
+            // REPEAT: 次の 1 バイトが追加繰り返し数。
+            let repeat = *data.get(pos)?;
+            pos = pos.checked_add(1)?;
+            for _ in 0..repeat {
+                if flags.len() >= num_points {
+                    break;
+                }
+                flags.push(f);
+            }
+        }
+    }
+
+    // x デルタ列を読んで累積座標化。
+    let mut xs = Vec::with_capacity(num_points);
+    let mut x = 0i32;
+    for &f in &flags {
+        let dx: i32 = if f & 0x02 != 0 {
+            // X_SHORT: u8、符号は X_SAME_OR_POSITIVE_SHORT(0x10) ビット。
+            let v = *data.get(pos)? as i32;
+            pos = pos.checked_add(1)?;
+            if f & 0x10 != 0 {
+                v
+            } else {
+                -v
+            }
+        } else if f & 0x10 != 0 {
+            // SAME: デルタ 0。
+            0
+        } else {
+            // i16。
+            let v = read_i16(data, pos)? as i32;
+            pos = pos.checked_add(2)?;
+            v
+        };
+        x = x.wrapping_add(dx);
+        xs.push(x);
+    }
+
+    // y デルタ列を読んで累積座標化。
+    let mut ys = Vec::with_capacity(num_points);
+    let mut y = 0i32;
+    for &f in &flags {
+        let dy: i32 = if f & 0x04 != 0 {
+            // Y_SHORT: u8、符号は Y_SAME_OR_POSITIVE_SHORT(0x20) ビット。
+            let v = *data.get(pos)? as i32;
+            pos = pos.checked_add(1)?;
+            if f & 0x20 != 0 {
+                v
+            } else {
+                -v
+            }
+        } else if f & 0x20 != 0 {
+            0
+        } else {
+            let v = read_i16(data, pos)? as i32;
+            pos = pos.checked_add(2)?;
+            v
+        };
+        y = y.wrapping_add(dy);
+        ys.push(y);
+    }
+
+    // 点列を構築。
+    let mut points = Vec::with_capacity(num_points);
+    for i in 0..num_points {
+        points.push(GlyphPoint {
+            x: xs[i] as f64,
+            y: ys[i] as f64,
+            on_curve: flags[i] & 0x01 != 0,
+        });
+    }
+
+    // 各輪郭をセグメント列へ変換。
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for &end in &end_pts {
+        let end = end as usize;
+        if end >= num_points || end < start {
+            // 不正な endPt（昇順でない / 範囲外）。この輪郭は読み飛ばす。
+            start = end.wrapping_add(1);
+            continue;
+        }
+        emit_contour(&mut out, &points[start..=end]);
+        start = end + 1;
+    }
+    Some(out)
+}
+
+/// 1 輪郭分の点列をセグメント列へ変換して `out` に追記する。
+/// 2 次ベジェの on/off-curve 規則に従う。
+fn emit_contour(out: &mut Vec<OutlineSegment>, pts: &[GlyphPoint]) {
+    if pts.is_empty() {
+        return;
+    }
+    let n = pts.len();
+    let first = pts[0];
+    let last = pts[n - 1];
+
+    // 開始点（on-curve）と、その後に処理する点列の範囲を決める。
+    // start_pt を確定したうえで、残りの点を「開始点を含めて 1 周」する形に正規化する。
+    let start_pt: (f64, f64);
+    // 処理する点を (制御点扱いの開始 off-curve があれば) 含めた列として作る。
+    // ループは「開始 on-curve の次の点」から「開始点へ戻る直前」まで。
+    let body: Vec<GlyphPoint>;
+    if first.on_curve {
+        // 開始点 = 点0。点 1..n を処理し、最後に点0へ閉じる。
+        start_pt = (first.x, first.y);
+        body = pts[1..].to_vec();
+    } else if last.on_curve {
+        // 開始点 = 最後の on-curve 点。点 0..n-1 を処理し、最後に開始点へ閉じる。
+        start_pt = (last.x, last.y);
+        body = pts[..n - 1].to_vec();
+    } else {
+        // 両端 off-curve: 中点を暗黙の開始 on-curve 点とする。
+        // その後 点0..n を全て処理し、最後に開始点へ閉じる。
+        start_pt = ((first.x + last.x) / 2.0, (first.y + last.y) / 2.0);
+        body = pts.to_vec();
+    }
+
+    out.push(OutlineSegment::MoveTo(start_pt.0, start_pt.1));
+
+    // pending は未確定の off-curve 制御点。
+    let mut pending: Option<(f64, f64)> = None;
+    for p in &body {
+        if p.on_curve {
+            match pending.take() {
+                Some((cx, cy)) => out.push(OutlineSegment::QuadTo(cx, cy, p.x, p.y)),
+                None => out.push(OutlineSegment::LineTo(p.x, p.y)),
+            }
+        } else {
+            match pending.take() {
+                Some((cx, cy)) => {
+                    // 連続 off-curve: 中点に暗黙 on-curve 点。
+                    let mx = (cx + p.x) / 2.0;
+                    let my = (cy + p.y) / 2.0;
+                    out.push(OutlineSegment::QuadTo(cx, cy, mx, my));
+                    pending = Some((p.x, p.y));
+                }
+                None => pending = Some((p.x, p.y)),
+            }
+        }
+    }
+
+    // 輪郭末尾は開始点へ閉じる（最後の off-curve 点があれば制御点に）。
+    match pending.take() {
+        Some((cx, cy)) => out.push(OutlineSegment::QuadTo(cx, cy, start_pt.0, start_pt.1)),
+        None => out.push(OutlineSegment::LineTo(start_pt.0, start_pt.1)),
+    }
+    out.push(OutlineSegment::Close);
 }
 
 #[cfg(test)]
@@ -1086,6 +1569,396 @@ mod tests {
         assert!(font.advance_width(gid_a.unwrap()) > 0);
         assert!(font.post_script_name().to_lowercase().contains("arial"));
         assert!(!font.is_cff());
+    }
+
+    /// 任意の glyf/loca を指定して最小限の有効な sfnt を組み立てる。
+    /// `glyf` は glyf テーブルの生バイト、`loca_bytes` は実バイトオフセット列
+    /// （長さ num_glyphs+1）。loca は long 形式（indexToLocFormat=1）で書く。
+    fn build_font_with_glyf(glyf: Vec<u8>, loca_offsets: &[u32], num_glyphs: u16) -> Vec<u8> {
+        // head（indexToLocFormat=1）。
+        let mut head = vec![0u8; 54];
+        head[18..20].copy_from_slice(&1000u16.to_be_bytes());
+        head[36..38].copy_from_slice(&(-200i16).to_be_bytes());
+        head[38..40].copy_from_slice(&(-200i16).to_be_bytes());
+        head[40..42].copy_from_slice(&1000i16.to_be_bytes());
+        head[42..44].copy_from_slice(&1000i16.to_be_bytes());
+        head[50..52].copy_from_slice(&1i16.to_be_bytes()); // long loca
+
+        let mut maxp = vec![0u8; 32];
+        maxp[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        maxp[4..6].copy_from_slice(&num_glyphs.to_be_bytes());
+
+        let mut hhea = vec![0u8; 36];
+        hhea[4..6].copy_from_slice(&800i16.to_be_bytes());
+        hhea[6..8].copy_from_slice(&(-200i16).to_be_bytes());
+        hhea[34..36].copy_from_slice(&1u16.to_be_bytes()); // numberOfHMetrics = 1
+
+        let mut hmtx = Vec::new();
+        push_u16(&mut hmtx, 500);
+        push_i16(&mut hmtx, 0);
+
+        // loca（long）。
+        let mut loca = Vec::new();
+        for &o in loca_offsets {
+            push_u32(&mut loca, o);
+        }
+
+        let entries: Vec<(&[u8; 4], Vec<u8>)> = vec![
+            (b"glyf", glyf),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"hmtx", hmtx),
+            (b"loca", loca),
+            (b"maxp", maxp),
+        ];
+        assemble_sfnt(&entries)
+    }
+
+    /// テーブル列から sfnt バイト列を組み立てる（test_synthetic_font と同方式）。
+    fn assemble_sfnt(entries: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, 0x0001_0000);
+        push_u16(&mut out, entries.len() as u16);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+
+        let header_size = 12 + 16 * entries.len();
+        let mut data_offset = header_size;
+        let mut offsets = Vec::new();
+        for (_, body) in entries {
+            offsets.push(data_offset);
+            let mut len = body.len();
+            if !len.is_multiple_of(4) {
+                len += 4 - (len % 4);
+            }
+            data_offset += len;
+        }
+        for (i, (tag, body)) in entries.iter().enumerate() {
+            out.extend_from_slice(*tag);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, offsets[i] as u32);
+            push_u32(&mut out, body.len() as u32);
+        }
+        for (_, body) in entries {
+            out.extend_from_slice(body);
+            let pad = (4 - (body.len() % 4)) % 4;
+            out.resize(out.len() + pad, 0);
+        }
+        out
+    }
+
+    /// 単純グリフ 1 つ分の glyf バイトを組み立てる。
+    /// `contours` は各輪郭の点列 (x, y, on_curve)。すべて i16 デルタで書く（SHORT 不使用）。
+    fn build_simple_glyf(contours: &[Vec<(i16, i16, bool)>]) -> Vec<u8> {
+        let mut g = Vec::new();
+        let num_contours = contours.len() as i16;
+        push_i16(&mut g, num_contours);
+        // bbox（適当）。
+        push_i16(&mut g, 0);
+        push_i16(&mut g, 0);
+        push_i16(&mut g, 1000);
+        push_i16(&mut g, 1000);
+        // endPtsOfContours。
+        let mut total = 0u16;
+        for c in contours {
+            total += c.len() as u16;
+            push_u16(&mut g, total - 1);
+        }
+        // instructionLength = 0。
+        push_u16(&mut g, 0);
+        // フラグ列（すべて i16 デルタ; ON_CURVE のみビット指定）。
+        let mut all_pts = Vec::new();
+        for c in contours {
+            for &p in c {
+                all_pts.push(p);
+            }
+        }
+        for &(_, _, on) in &all_pts {
+            let flag: u8 = if on { 0x01 } else { 0x00 };
+            g.push(flag);
+        }
+        // x デルタ（i16、絶対座標から差分化）。
+        let mut prev = 0i16;
+        for &(x, _, _) in &all_pts {
+            push_i16(&mut g, x - prev);
+            prev = x;
+        }
+        // y デルタ。
+        let mut prev = 0i16;
+        for &(_, y, _) in &all_pts {
+            push_i16(&mut g, y - prev);
+            prev = y;
+        }
+        g
+    }
+
+    #[test]
+    fn test_glyph_outline_triangle() {
+        // gid1 に三角形（on-curve のみ、1 輪郭）。
+        let tri = build_simple_glyf(&[vec![(0, 0, true), (300, 0, true), (150, 400, true)]]);
+        let glyf_len = tri.len() as u32;
+        // gid0 空, gid1 = 三角形。
+        let mut glyf = Vec::new();
+        glyf.extend_from_slice(&tri);
+        let data = build_font_with_glyf(glyf, &[0, 0, glyf_len], 2);
+        let font = TrueTypeFont::parse(data, 0).expect("parse");
+
+        // gid0 は空。
+        assert_eq!(font.glyph_outline(0), Some(vec![]));
+        let segs = font.glyph_outline(1).expect("outline");
+        assert_eq!(
+            segs,
+            vec![
+                OutlineSegment::MoveTo(0.0, 0.0),
+                OutlineSegment::LineTo(300.0, 0.0),
+                OutlineSegment::LineTo(150.0, 400.0),
+                OutlineSegment::LineTo(0.0, 0.0),
+                OutlineSegment::Close,
+            ]
+        );
+        // 範囲外。
+        assert_eq!(font.glyph_outline(99), None);
+    }
+
+    #[test]
+    fn test_glyph_outline_offcurve() {
+        // 開始 on-curve、続いて off-curve 制御点、最後 on-curve。
+        // 点: (0,0,on), (100,200,off), (200,0,on)。
+        // 期待: MoveTo(0,0), QuadTo(100,200, 200,0), LineTo(0,0), Close。
+        let g = build_simple_glyf(&[vec![(0, 0, true), (100, 200, false), (200, 0, true)]]);
+        let glyf_len = g.len() as u32;
+        let data = build_font_with_glyf(g, &[0, 0, glyf_len], 2);
+        let font = TrueTypeFont::parse(data, 0).expect("parse");
+        let segs = font.glyph_outline(1).expect("outline");
+        assert_eq!(
+            segs,
+            vec![
+                OutlineSegment::MoveTo(0.0, 0.0),
+                OutlineSegment::QuadTo(100.0, 200.0, 200.0, 0.0),
+                OutlineSegment::LineTo(0.0, 0.0),
+                OutlineSegment::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_glyph_outline_two_consecutive_offcurve() {
+        // 開始 on-curve、連続する 2 つの off-curve 点（間に暗黙中点）。
+        // 点: (0,0,on), (100,200,off), (300,200,off), (400,0,on)。
+        // 中点 (200,200) が暗黙 on-curve。
+        let g = build_simple_glyf(&[vec![
+            (0, 0, true),
+            (100, 200, false),
+            (300, 200, false),
+            (400, 0, true),
+        ]]);
+        let glyf_len = g.len() as u32;
+        let data = build_font_with_glyf(g, &[0, 0, glyf_len], 2);
+        let font = TrueTypeFont::parse(data, 0).expect("parse");
+        let segs = font.glyph_outline(1).expect("outline");
+        assert_eq!(
+            segs,
+            vec![
+                OutlineSegment::MoveTo(0.0, 0.0),
+                OutlineSegment::QuadTo(100.0, 200.0, 200.0, 200.0),
+                OutlineSegment::QuadTo(300.0, 200.0, 400.0, 0.0),
+                OutlineSegment::LineTo(0.0, 0.0),
+                OutlineSegment::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_glyph_outline_start_offcurve() {
+        // 開始点が off-curve、最後の点が on-curve のケース。
+        // 点: (100,200,off), (200,0,on)。
+        // 開始点 = 最後の on-curve (200,0)。続いて点0..n-1 = [(100,200,off)] を処理し閉じる。
+        // 期待: MoveTo(200,0), QuadTo(100,200, 200,0), Close。
+        let g = build_simple_glyf(&[vec![(100, 200, false), (200, 0, true)]]);
+        let glyf_len = g.len() as u32;
+        let data = build_font_with_glyf(g, &[0, 0, glyf_len], 2);
+        let font = TrueTypeFont::parse(data, 0).expect("parse");
+        let segs = font.glyph_outline(1).expect("outline");
+        assert_eq!(
+            segs,
+            vec![
+                OutlineSegment::MoveTo(200.0, 0.0),
+                OutlineSegment::QuadTo(100.0, 200.0, 200.0, 0.0),
+                OutlineSegment::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_glyph_outline_composite() {
+        // gid1 = 三角形（子）、gid2 = composite（gid1 を dx=500, dy=0 でオフセット）。
+        let tri = build_simple_glyf(&[vec![(0, 0, true), (300, 0, true), (150, 400, true)]]);
+        let tri_len = tri.len() as u32;
+
+        // composite グリフ: numberOfContours = -1。
+        let mut comp = Vec::new();
+        push_i16(&mut comp, -1);
+        // bbox。
+        push_i16(&mut comp, 0);
+        push_i16(&mut comp, 0);
+        push_i16(&mut comp, 1000);
+        push_i16(&mut comp, 1000);
+        // コンポーネント 1: flags = ARG_1_AND_2_ARE_WORDS(0x01) | ARGS_ARE_XY_VALUES(0x02)。
+        push_u16(&mut comp, 0x0001 | 0x0002);
+        push_u16(&mut comp, 1); // glyphIndex = gid1
+        push_i16(&mut comp, 500); // dx
+        push_i16(&mut comp, 0); // dy
+        let comp_len = comp.len() as u32;
+
+        let mut glyf = Vec::new();
+        glyf.extend_from_slice(&tri);
+        glyf.extend_from_slice(&comp);
+        // loca: gid0=0(空), gid1=0..tri_len, gid2=tri_len..tri_len+comp_len。
+        let data = build_font_with_glyf(glyf, &[0, 0, tri_len, tri_len + comp_len], 3);
+        let font = TrueTypeFont::parse(data, 0).expect("parse");
+
+        let segs = font.glyph_outline(2).expect("composite outline");
+        // 三角形を x+500 平行移動したもの。
+        assert_eq!(
+            segs,
+            vec![
+                OutlineSegment::MoveTo(500.0, 0.0),
+                OutlineSegment::LineTo(800.0, 0.0),
+                OutlineSegment::LineTo(650.0, 400.0),
+                OutlineSegment::LineTo(500.0, 0.0),
+                OutlineSegment::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_glyph_outline_malformed() {
+        // ランダム/切り詰めた glyf でも panic しないこと。
+        for seed in 0..64u32 {
+            let len = (seed as usize * 5) % 80;
+            let glyf: Vec<u8> = (0..len)
+                .map(|i| ((i as u32).wrapping_mul(seed).wrapping_add(7)) as u8)
+                .collect();
+            let glyf_len = glyf.len() as u32;
+            let data = build_font_with_glyf(glyf, &[0, 0, glyf_len, glyf_len], 3);
+            if let Ok(font) = TrueTypeFont::parse(data, 0) {
+                // どの gid でも panic しなければよい。
+                let _ = font.glyph_outline(0);
+                let _ = font.glyph_outline(1);
+                let _ = font.glyph_outline(2);
+                let _ = font.glyph_outline(9999);
+            }
+        }
+
+        // numberOfContours が極端に大きい単純グリフ（上限超過 → None 期待だが panic しないこと）。
+        let mut bad = Vec::new();
+        push_i16(&mut bad, 2000); // num_contours > 上限
+        for _ in 0..4 {
+            push_i16(&mut bad, 0);
+        }
+        let bad_len = bad.len() as u32;
+        let data = build_font_with_glyf(bad, &[0, 0, bad_len], 2);
+        if let Ok(font) = TrueTypeFont::parse(data, 0) {
+            assert_eq!(font.glyph_outline(1), None);
+        }
+    }
+
+    #[test]
+    fn test_glyph_outline_arial() {
+        let path = "C:\\Windows\\Fonts\\arial.ttf";
+        let Ok(data) = std::fs::read(path) else {
+            eprintln!("skip test_glyph_outline_arial: {path} not found");
+            return;
+        };
+        let font = TrueTypeFont::parse(data, 0).expect("arial parse");
+        let bbox = font.font_bbox();
+        // bbox に 10% マージンを付与。
+        let w = (bbox[2] - bbox[0]).abs();
+        let h = (bbox[3] - bbox[1]).abs();
+        let mx = (w / 10).max(1) as f64;
+        let my = (h / 10).max(1) as f64;
+        let lo_x = bbox[0] as f64 - mx;
+        let hi_x = bbox[2] as f64 + mx;
+        let lo_y = bbox[1] as f64 - my;
+        let hi_y = bbox[3] as f64 + my;
+
+        let gid_a = font.glyph_id('A').expect("'A' gid");
+        let segs = font.glyph_outline(gid_a).expect("'A' outline");
+        assert!(!segs.is_empty(), "'A' outline は空でないはず");
+        // 全座標が bbox 範囲（±10%）に収まること。
+        let check = |x: f64, y: f64| {
+            assert!(
+                x >= lo_x && x <= hi_x && y >= lo_y && y <= hi_y,
+                "座標 ({x},{y}) が bbox 範囲外: x[{lo_x}..{hi_x}] y[{lo_y}..{hi_y}]"
+            );
+        };
+        for seg in &segs {
+            match *seg {
+                OutlineSegment::MoveTo(x, y) | OutlineSegment::LineTo(x, y) => check(x, y),
+                OutlineSegment::QuadTo(cx, cy, ex, ey) => {
+                    check(cx, cy);
+                    check(ex, ey);
+                }
+                OutlineSegment::Close => {}
+            }
+        }
+
+        // composite グリフを loca から探して outline が Some であること。
+        // 'é'（U+00E9）はたいてい composite。無ければ任意の composite を走査。
+        let mut found_composite = false;
+        if let Some(gid) = font.glyph_id('é') {
+            if let Some(d) = font.glyph_data(gid) {
+                if read_i16(d, 0).map(|n| n < 0).unwrap_or(false) {
+                    assert!(font.glyph_outline(gid).is_some());
+                    found_composite = true;
+                }
+            }
+        }
+        if !found_composite {
+            for gid in 0..font.num_glyphs() {
+                if let Some(d) = font.glyph_data(gid) {
+                    if read_i16(d, 0).map(|n| n < 0).unwrap_or(false) {
+                        assert!(
+                            font.glyph_outline(gid).is_some(),
+                            "composite gid {gid} の outline が None"
+                        );
+                        found_composite = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_composite, "arial に composite グリフが見つからない");
+    }
+
+    #[test]
+    fn test_symbolic_cmap() {
+        // symbol.ttf か wingding.ttf があれば glyph_id_by_code を試す。
+        let candidates = [
+            "C:\\Windows\\Fonts\\symbol.ttf",
+            "C:\\Windows\\Fonts\\wingding.ttf",
+        ];
+        let mut tested = false;
+        for path in candidates {
+            let Ok(data) = std::fs::read(path) else {
+                continue;
+            };
+            let font = TrueTypeFont::parse(data, 0).expect("symbolic font parse");
+            // 0x41 など適当なコードで Some を期待。
+            let mut any = false;
+            for code in 0x20u32..0x80 {
+                if font.glyph_id_by_code(code).is_some() {
+                    any = true;
+                    break;
+                }
+            }
+            assert!(any, "{path}: glyph_id_by_code が全コードで None");
+            tested = true;
+        }
+        if !tested {
+            eprintln!("skip test_symbolic_cmap: symbol.ttf/wingding.ttf not found");
+        }
     }
 
     #[test]
