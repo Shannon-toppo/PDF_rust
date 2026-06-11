@@ -99,7 +99,10 @@ doc.save("edited.pdf")?;     // 完全書き直しで保存
 | `doc.page_resources(id)` | 実効 `/Resources` 辞書 |
 | `doc.extract_text(index)` | テキスト抽出 |
 | `doc.extract_text_spans(index)` | 位置付きテキスト抽出。`Vec<TextSpan { text, bbox, font_size }>`（テキスト選択・検索ハイライト用。bbox はユーザー空間） |
-| `doc.render_page(index, scale)` | ページを `Pixmap`（RGBA）にラスタライズ（注釈の外観 `/AP` 込み）。`pixmap.save_png(path)` / `pixmap.to_png()` で PNG 化 |
+| `doc.render_page(index, scale)` | ページを `Pixmap`（RGBA）にラスタライズ（注釈の外観 `/AP` 込み）。`pixmap.save_png(path)` / `pixmap.to_png()` で PNG 化。`render_page_with` の薄いラッパ |
+| `doc.render_page_with(index, &RenderOptions)` | オプション付きラスタライズ。`RenderOptions { scale, region, cancel, annotations, quality }` で領域（タイル）レンダリング・協調キャンセル（`PdfError::Cancelled`）・注釈の ON/OFF・品質切替（`Fast` = AA 1x + 最近傍補間）を制御 |
+| `doc.render_page_into(index, &RenderOptions, &mut Pixmap)` | 出力先 `Pixmap` を再利用する変種（連続レンダリングでの再確保回避。サイズ不一致は内部で作り直す） |
+| `doc.page_size(index)` | `/Rotate` 反映済みの論理ページサイズ `(幅, 高さ)`（pt）。DPI 換算は `scale = dpi / 72.0` |
 
 #### ビューワー機能（しおり・リンク・ページラベル）
 
@@ -392,7 +395,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `filters::dct` | baseline JPEG（DCTDecode）デコーダ。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
 | `function` | PDF 関数（§7.10）インタプリタ。Type 0（サンプル）/ 2（指数）/ 3（継ぎ接ぎ）/ 4（PostScript 電卓） |
 | `encoding` | 単純フォントのエンコーディング解決（Standard/MacRoman/`/Differences`/グリフ名） |
-| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ）/ `state`（演算解釈 + 注釈外観 `/AP` の描画）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画） |
+| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ）/ `state`（演算解釈 + 注釈外観 `/AP` の描画）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画）。`RenderOptions` で領域（タイル）レンダリング（基底 CTM へ `translate(-x,-y)` 合成）・協調キャンセル（`AtomicBool`、演算ループ/グリフ/画像行単位で確認）・品質切替を制御 |
 
 ### 4.2 設計上の選択
 
@@ -418,7 +421,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 ### 4.3 テスト
 
 ```
-cargo test          # ユニット 198 + 統合 47 + doctest 2
+cargo test          # ユニット 198 + 統合 55 + doctest 3
 ```
 
 - フィルタは既知ベクタ（.NET `ZLibStream` で生成した zlib データ、
@@ -447,6 +450,10 @@ cargo test          # ユニット 198 + 統合 47 + doctest 2
 - ✅ レンダリング: `render_page` でページを RGBA ラスタライズ（PNG 書き出し）。
   パス（塗り/ストローク/ダッシュ/クリップ、アンチエイリアス）、テキスト
   （埋め込み TrueType + システムフォント代替）、Form XObject 再帰
+- ✅ レンダリング制御: `render_page_with` / `render_page_into`（`RenderOptions`）。
+  領域（タイル）レンダリング（全面結果の切り出しとピクセル一致）、協調
+  キャンセル（`PdfError::Cancelled`）、出力バッファ再利用、注釈の ON/OFF、
+  高速品質モード（AA 1x + 最近傍補間）、`page_size`（/Rotate 反映済み pt サイズ）
 - ✅ 画像描画: 画像 XObject とインライン画像（BI）。BitsPerComponent 1/2/4/8/16、
   `/Decode`、ImageMask（ステンシル）、SMask（アルファ）、baseline JPEG（DCTDecode）、
   ExtGState `/ca`、回転・せん断 CTM（双線形/最近傍サンプリング）

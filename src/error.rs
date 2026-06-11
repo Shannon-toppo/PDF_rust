@@ -30,6 +30,8 @@ pub enum PdfError {
     EncryptionNotSupported,
     /// ページ番号が範囲外。
     PageOutOfRange { index: usize, count: usize },
+    /// レンダリングが協調キャンセルされた（[`crate::render::RenderOptions::cancel`]）。
+    Cancelled,
     /// その他の不正な操作・データ。
     Invalid(String),
 }
@@ -56,6 +58,7 @@ impl fmt::Display for PdfError {
             PdfError::PageOutOfRange { index, count } => {
                 write!(f, "page index {index} out of range (page count = {count})")
             }
+            PdfError::Cancelled => write!(f, "rendering was cancelled"),
             PdfError::Invalid(m) => write!(f, "invalid: {m}"),
         }
     }

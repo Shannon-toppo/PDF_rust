@@ -35,7 +35,8 @@ doc.save("output.pdf")?;
 - **日本語描画**: TrueType/TTC フォント埋め込み・自動サブセット化・Identity-H（`add_text_with_font`）
 - **レンダリング**: ページを PNG にラスタライズ（`render_page`）。ベクタ図形・
   TrueType テキスト・画像（baseline JPEG / FlateDecode 等）・各種色空間・
-  注釈の外観ストリーム（/AP）に対応
+  注釈の外観ストリーム（/AP）に対応。`render_page_with`（`RenderOptions`）で
+  領域（タイル）レンダリング・協調キャンセル・バッファ再利用・品質切替も可能
 - **読み込み対応形式**: 古典 xref / クロスリファレンスストリーム /
   オブジェクトストリーム（PDF 1.5+）/ ハイブリッド / 破損 xref の自動再構築
 - **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,

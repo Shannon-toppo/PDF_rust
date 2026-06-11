@@ -21,12 +21,15 @@
 //! panic しない。`unwrap`/`expect`/直接インデックスは使わない。
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::colorspace::ColorSpace;
 use super::path::{Matrix, Path};
 use super::pixmap::Pixmap;
-use super::raster::{fill_path, stroke_to_path, FillRule, LineCap, LineJoin, Mask, StrokeStyle};
+use super::raster::{fill_path_aa, stroke_to_path, FillRule, LineCap, LineJoin, Mask, StrokeStyle};
 use super::text::{build_render_font, FontCache, RenderFont};
+use super::RenderQuality;
 use crate::content::{parse_content, Operation};
 use crate::document::Document;
 use crate::object::{Dictionary, Object};
@@ -37,6 +40,15 @@ const MAX_XOBJECT_DEPTH: u32 = 16;
 
 /// 平坦化トレランス（デバイス空間ピクセル単位）。
 const TOLERANCE: f64 = 0.25;
+
+/// 演算ループでキャンセルフラグを確認する間隔（演算数）。
+const CANCEL_CHECK_INTERVAL: u32 = 16;
+
+/// 通常品質の縦サブスキャン本数（[`super::raster`] の既定と同じ）。
+const SUBSAMPLES_NORMAL: u32 = 4;
+
+/// 高速品質の縦サブスキャン本数。
+const SUBSAMPLES_FAST: u32 = 1;
 
 /// グラフィックス状態（`q`/`Q` で退避・復元される一式）。
 #[derive(Debug, Clone)]
@@ -146,6 +158,16 @@ pub struct Renderer<'a> {
     font_cache: FontCache,
     /// フォントリソース名 → 解決済み RenderFont のキャッシュ。
     font_by_name: std::collections::HashMap<String, Rc<RenderFont>>,
+    /// 協調キャンセルフラグ（[`super::RenderOptions::cancel`]）。
+    cancel: Option<Arc<AtomicBool>>,
+    /// キャンセルを検知済みか（以後の演算は読み飛ばす）。
+    cancelled: bool,
+    /// 演算実行数のカウンタ（[`CANCEL_CHECK_INTERVAL`] ごとにフラグを確認）。
+    op_counter: u32,
+    /// 塗りの縦サブスキャン本数（Normal=4 / Fast=1）。
+    subsamples: u32,
+    /// 画像の双線形補間を許可するか（Fast では最近傍に落とす）。
+    bilinear_allowed: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -169,15 +191,83 @@ impl<'a> Renderer<'a> {
             line_matrix: Matrix::identity(),
             font_cache: FontCache::new(),
             font_by_name: std::collections::HashMap::new(),
+            cancel: None,
+            cancelled: false,
+            op_counter: 0,
+            subsamples: SUBSAMPLES_NORMAL,
+            bilinear_allowed: true,
         }
+    }
+
+    /// 協調キャンセルフラグを設定する。
+    ///
+    /// フラグが `true` になると演算ループ・グリフ描画・画像デコードの内周で
+    /// 検知して以後の描画を打ち切る。中断されたかは
+    /// [`is_cancelled`](Self::is_cancelled) で確認できる。
+    pub fn set_cancel_flag(&mut self, cancel: Option<Arc<AtomicBool>>) {
+        self.cancel = cancel;
+    }
+
+    /// 描画品質を設定する（[`RenderQuality::Fast`] は AA 縦サブスキャン 1x +
+    /// 画像最近傍サンプリング）。
+    pub fn set_quality(&mut self, quality: RenderQuality) {
+        match quality {
+            RenderQuality::Normal => {
+                self.subsamples = SUBSAMPLES_NORMAL;
+                self.bilinear_allowed = true;
+            }
+            RenderQuality::Fast => {
+                self.subsamples = SUBSAMPLES_FAST;
+                self.bilinear_allowed = false;
+            }
+        }
+    }
+
+    /// キャンセルを検知して描画を打ち切ったか。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// キャンセルフラグを確認する（検知したら `cancelled` を立てて true）。
+    fn check_cancel(&mut self) -> bool {
+        if self.cancelled {
+            return true;
+        }
+        if let Some(c) = &self.cancel {
+            if c.load(Ordering::Relaxed) {
+                self.cancelled = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 演算ループ用のキャンセル確認（[`CANCEL_CHECK_INTERVAL`] 件ごとに
+    /// フラグを読む。アトミック読みのコストを抑えるための間引き）。
+    fn check_cancel_throttled(&mut self) -> bool {
+        if self.cancelled {
+            return true;
+        }
+        if self.cancel.is_none() {
+            return false;
+        }
+        self.op_counter = self.op_counter.wrapping_add(1);
+        if !self.op_counter.is_multiple_of(CANCEL_CHECK_INTERVAL) {
+            return false;
+        }
+        self.check_cancel()
     }
 
     /// 演算列を解釈して描画する。
     ///
     /// `resources` はこの演算列の実効リソース辞書（ページまたは Form の
-    /// `/Resources`）。`/XObject` の解決に使う。
+    /// `/Resources`）。`/XObject` の解決に使う。キャンセルを検知した場合は
+    /// 残りの演算を実行せずに戻る。
     pub fn run(&mut self, ops: &[Operation], resources: &Dictionary) {
         for op in ops {
+            if self.check_cancel_throttled() {
+                return;
+            }
             self.exec(op, resources);
         }
     }
@@ -508,13 +598,14 @@ impl<'a> Renderer<'a> {
         // 塗り（デバイス空間へ変換してから）。
         if do_fill && !self.path.is_empty() {
             let dev = self.path.transform(&gs.ctm);
-            fill_path(
+            fill_path_aa(
                 self.pm,
                 &dev,
                 fill_rule,
                 gs.fill_color,
                 255,
                 gs.clip.as_ref(),
+                self.subsamples,
             );
         }
 
@@ -532,13 +623,14 @@ impl<'a> Renderer<'a> {
             let tol = TOLERANCE / scale;
             let outline = stroke_to_path(&self.path, &style, tol);
             let dev = outline.transform(&gs.ctm);
-            fill_path(
+            fill_path_aa(
                 self.pm,
                 &dev,
                 FillRule::NonZero,
                 gs.stroke_color,
                 255,
                 gs.clip.as_ref(),
+                self.subsamples,
             );
         }
 
@@ -748,6 +840,9 @@ impl<'a> Renderer<'a> {
 
                 self.depth += 1;
                 for op in &ops {
+                    if self.check_cancel_throttled() {
+                        break;
+                    }
                     self.exec(op, &form_res);
                 }
                 self.depth -= 1;
@@ -915,6 +1010,9 @@ impl<'a> Renderer<'a> {
 
                 self.depth += 1;
                 for op in &ops {
+                    if self.check_cancel_throttled() {
+                        break;
+                    }
                     self.exec(op, &form_res);
                 }
                 self.depth -= 1;
@@ -964,9 +1062,11 @@ impl<'a> Renderer<'a> {
     /// 画像 XObject（`Do` の Subtype=Image）を描画する。
     fn draw_image_xobject(&mut self, dict: &Dictionary, raw: &[u8], resources: &Dictionary) {
         let gs = self.gs();
-        let img = match super::image::decode_image(self.doc, dict, raw, resources) {
+        let cancel = self.cancel.clone();
+        let cancel_ref = cancel.as_deref();
+        let img = match super::image::decode_image(self.doc, dict, raw, resources, cancel_ref) {
             Some(i) => i,
-            None => return, // 未対応形式・壊れた画像は読み飛ばす。
+            None => return, // 未対応形式・壊れた画像（またはキャンセル）は読み飛ばす。
         };
         super::image::draw_image(
             self.pm,
@@ -975,6 +1075,8 @@ impl<'a> Renderer<'a> {
             gs.clip.as_ref(),
             gs.fill_alpha,
             gs.fill_color,
+            self.bilinear_allowed,
+            cancel_ref,
         );
     }
 
@@ -1112,6 +1214,10 @@ impl<'a> Renderer<'a> {
         let single_byte = font.is_single_byte();
         let codes = font.codes(bytes);
         for code in codes {
+            // グリフ単位のキャンセル確認（長大なテキストの内周）。
+            if self.check_cancel() {
+                return;
+            }
             // グリフ描画（render_mode 3 = 不可視は描かない）。
             if gs.render_mode != 3 && gs.render_mode != 7 {
                 self.draw_glyph(&font, code, &gs);
@@ -1161,13 +1267,14 @@ impl<'a> Renderer<'a> {
         let do_stroke = matches!(mode, 1 | 2 | 5 | 6);
 
         if do_fill {
-            fill_path(
+            fill_path_aa(
                 self.pm,
                 &dev,
                 FillRule::NonZero,
                 gs.fill_color,
                 255,
                 gs.clip.as_ref(),
+                self.subsamples,
             );
         }
         if do_stroke {
@@ -1186,13 +1293,14 @@ impl<'a> Renderer<'a> {
             let glyph_path = path.transform(&glyph_to_text);
             let outline_path = stroke_to_path(&glyph_path, &style, tol);
             let stroked = outline_path.transform(&text_to_device);
-            fill_path(
+            fill_path_aa(
                 self.pm,
                 &stroked,
                 FillRule::NonZero,
                 gs.stroke_color,
                 255,
                 gs.clip.as_ref(),
+                self.subsamples,
             );
         }
     }

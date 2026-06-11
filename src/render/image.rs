@@ -32,6 +32,8 @@
 //! checked / saturating を用い、壊れた・切り詰められた入力でも panic しない。
 //! ピクセル総数には上限ガード（[`MAX_PIXELS`]）を設ける。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::path::Matrix;
 use super::pixmap::Pixmap;
 use super::raster::Mask;
@@ -39,6 +41,11 @@ use crate::document::Document;
 use crate::object::{Dictionary, Object};
 
 use super::colorspace::ColorSpace;
+
+/// 協調キャンセルフラグが立っているか（`None` は常に false）。
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+}
 
 /// デコード後ピクセル総数（幅 × 高さ）の上限。過大な割り当てを防ぐ。
 const MAX_PIXELS: u64 = 1 << 26; // 約 6700 万ピクセル
@@ -159,12 +166,15 @@ struct ImageParams {
 ///
 /// `dict` は画像辞書、`raw` は **エンコードされたままの**データ、`resources`
 /// は色空間名の解決に使う実効リソース辞書。デコードできない（未対応形式・
-/// 壊れている等）場合は `None` を返す（panic しない）。
+/// 壊れている等）場合は `None` を返す（panic しない）。`cancel` は協調
+/// キャンセルフラグで、立っていたら途中で打ち切って `None` を返す
+/// （キャンセル全体の扱いは呼び出し側の Renderer が判定する）。
 pub(crate) fn decode_image(
     doc: &Document,
     dict: &Dictionary,
     raw: &[u8],
     resources: &Dictionary,
+    cancel: Option<&AtomicBool>,
 ) -> Option<DecodedImage> {
     let width = dict_int(dict, &["Width", "W"])?;
     let height = dict_int(dict, &["Height", "H"])?;
@@ -206,7 +216,7 @@ pub(crate) fn decode_image(
 
     // --- ImageMask（ステンシル）の経路 ---
     if image_mask {
-        return decode_image_mask(doc, dict, raw, width, height, &filters);
+        return decode_image_mask(doc, dict, raw, width, height, &filters, cancel);
     }
 
     // --- 通常の画像 ---
@@ -233,14 +243,17 @@ pub(crate) fn decode_image(
     };
 
     let mut img = if last_is_dct {
-        decode_dct_image(doc, dict, raw, &filters, &params)?
+        decode_dct_image(doc, dict, raw, &filters, &params, cancel)?
     } else {
-        decode_raster_image(doc, dict, raw, &params)?
+        decode_raster_image(doc, dict, raw, &params, cancel)?
     };
 
     // SMask（ソフトマスク）をアルファチャネルへ反映する。
-    apply_smask(doc, dict, resources, &mut img);
+    apply_smask(doc, dict, resources, &mut img, cancel);
 
+    if is_cancelled(cancel) {
+        return None;
+    }
     Some(img)
 }
 
@@ -252,6 +265,7 @@ fn decode_image_mask(
     width: u32,
     height: u32,
     filters: &[String],
+    cancel: Option<&AtomicBool>,
 ) -> Option<DecodedImage> {
     // ステンシルにフィルタが付くのは通常 Flate/Run 等。DCT 等はサポートしない。
     if filters
@@ -271,6 +285,9 @@ fn decode_image_mask(
     let row_bytes = (width as usize).div_ceil(8);
     let mut stencil = vec![false; (width as usize) * (height as usize)];
     for y in 0..height as usize {
+        if is_cancelled(cancel) {
+            return None;
+        }
         let row_off = y.checked_mul(row_bytes)?;
         for x in 0..width as usize {
             let byte = data.get(row_off + x / 8).copied().unwrap_or(0);
@@ -300,6 +317,7 @@ fn decode_dct_image(
     raw: &[u8],
     filters: &[String],
     params: &ImageParams,
+    cancel: Option<&AtomicBool>,
 ) -> Option<DecodedImage> {
     // 末尾 DCT の手前までのフィルタを剥がす。
     let dct_pos = filters.len().checked_sub(1)?;
@@ -310,6 +328,9 @@ fn decode_dct_image(
         strip_filters_subset(doc, dict, raw, pre)?
     };
 
+    if is_cancelled(cancel) {
+        return None;
+    }
     let decoded = crate::filters::dct::decode(&jpeg).ok()?;
     if decoded.width != params.width || decoded.height != params.height {
         // サイズが食い違う場合でも JPEG 側のサイズで描く（辞書が嘘のことがある）。
@@ -320,6 +341,10 @@ fn decode_dct_image(
     let mut pixels = vec![0u8; (w as usize).checked_mul(h as usize)?.checked_mul(4)?];
 
     for i in 0..(w as usize * h as usize) {
+        // 4096 ピクセルごとにキャンセルを確認（内周のオーバーヘッドを抑える）。
+        if i % 4096 == 0 && is_cancelled(cancel) {
+            return None;
+        }
         let base = i * nc;
         let rgb = match nc {
             // DCT が 3 成分なら ColorSpace 指定より優先して RGB とみなす。
@@ -369,6 +394,7 @@ fn decode_raster_image(
     dict: &Dictionary,
     raw: &[u8],
     params: &ImageParams,
+    cancel: Option<&AtomicBool>,
 ) -> Option<DecodedImage> {
     let filters = filter_names(doc, dict);
     let data = strip_filters(doc, dict, raw, &filters)?;
@@ -396,6 +422,9 @@ fn decode_raster_image(
 
     let mut comps = vec![0f64; n];
     for y in 0..height {
+        if is_cancelled(cancel) {
+            return None;
+        }
         let row_off = match y.checked_mul(row_bytes) {
             Some(v) => v,
             None => break,
@@ -488,7 +517,13 @@ impl<'a> BitReader<'a> {
 /// SMask は DeviceGray 画像で、各サンプルがアルファ（0=透明〜255=不透明）。
 /// 本体とサイズが異なる場合は最近傍でリサンプルする。/Mask（ステンシル・
 /// カラーキー）は今回スコープ外のため無視する。
-fn apply_smask(doc: &Document, dict: &Dictionary, resources: &Dictionary, img: &mut DecodedImage) {
+fn apply_smask(
+    doc: &Document,
+    dict: &Dictionary,
+    resources: &Dictionary,
+    img: &mut DecodedImage,
+    cancel: Option<&AtomicBool>,
+) {
     let smask_obj = match dict.get("SMask") {
         Some(o) => doc.resolve(o).clone(),
         None => return,
@@ -498,7 +533,13 @@ fn apply_smask(doc: &Document, dict: &Dictionary, resources: &Dictionary, img: &
         _ => return,
     };
     // SMask 画像をグレースケールとしてデコードする。
-    let mask = match decode_image(doc, &smask_stream.dict, &smask_stream.data, resources) {
+    let mask = match decode_image(
+        doc,
+        &smask_stream.dict,
+        &smask_stream.data,
+        resources,
+        cancel,
+    ) {
         Some(m) => m,
         None => return,
     };
@@ -509,6 +550,9 @@ fn apply_smask(doc: &Document, dict: &Dictionary, resources: &Dictionary, img: &
     let iw = img.width as usize;
     let ih = img.height as usize;
     for y in 0..ih {
+        if is_cancelled(cancel) {
+            return;
+        }
         for x in 0..iw {
             // 本体ピクセル (x,y) に対応する SMask テクセル（最近傍）。
             let u = (x as f64 + 0.5) / iw as f64;
@@ -539,6 +583,9 @@ fn apply_smask(doc: &Document, dict: &Dictionary, resources: &Dictionary, img: &
 /// `ctm` の逆行列でデバイスピクセル中心 → 画像 UV を逆写像し、サンプリング
 /// して合成する（回転・せん断も自然に扱える）。`clip` があれば被覆値を乗算、
 /// `alpha` は描画全体の不透明度（ExtGState `ca` 等）。`fill` はステンシル色。
+/// `bilinear_allowed` が偽なら常に最近傍サンプリング（高速品質モード用）、
+/// `cancel` は協調キャンセルフラグ（行単位で確認して打ち切る）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_image(
     pm: &mut Pixmap,
     img: &DecodedImage,
@@ -546,6 +593,8 @@ pub(crate) fn draw_image(
     clip: Option<&Mask>,
     alpha: u8,
     fill: [u8; 3],
+    bilinear_allowed: bool,
+    cancel: Option<&AtomicBool>,
 ) {
     if alpha == 0 || img.width == 0 || img.height == 0 {
         return;
@@ -584,13 +633,17 @@ pub(crate) fn draw_image(
         return;
     }
 
-    // サンプリング方式: force_nearest（ImageMask・1bpc 補間オフ）は最近傍、
-    // それ以外（拡大・回転を含む通常画像）は双線形。ステンシルは sample 内で
+    // サンプリング方式: force_nearest（ImageMask・1bpc 補間オフ）と
+    // 高速品質モード（bilinear_allowed = false）は最近傍、それ以外
+    // （拡大・回転を含む通常画像）は双線形。ステンシルは sample 内で
     // bilinear フラグを無視して常に最近傍になる。
-    let bilinear = !img.force_nearest;
+    let bilinear = bilinear_allowed && !img.force_nearest;
 
     let base_alpha = alpha as u32;
     for py in y_start..y_end {
+        if is_cancelled(cancel) {
+            return;
+        }
         for px in x_start..x_end {
             // デバイスピクセル中心を画像 UV へ逆写像。
             let dx = px as f64 + 0.5;
@@ -854,7 +907,7 @@ mod tests {
             255, 0, 0, 0, 255, 0, // row 0: 赤, 緑
             0, 0, 255, 255, 255, 255, // row 1: 青, 白
         ];
-        let img = decode_image(&doc, &dict, &raw, &Dictionary::new()).unwrap();
+        let img = decode_image(&doc, &dict, &raw, &Dictionary::new(), None).unwrap();
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.texel(0, 0).0, [255, 0, 0]);
@@ -878,7 +931,7 @@ mod tests {
         );
         // raw 0（通常は黒）→ 反転で白、raw 255 → 黒。
         let raw = vec![0u8, 255];
-        let img = decode_image(&doc, &dict, &raw, &Dictionary::new()).unwrap();
+        let img = decode_image(&doc, &dict, &raw, &Dictionary::new(), None).unwrap();
         assert_eq!(img.texel(0, 0).0, [255, 255, 255]);
         assert_eq!(img.texel(1, 0).0, [0, 0, 0]);
     }
@@ -905,7 +958,7 @@ mod tests {
         // 1bpc, 幅 2 → 1 バイト（上位 2 ビットが index 0,1）。
         // index 0 → 赤, index 1 → 青。ビット列 0b01...
         let raw = vec![0b0100_0000u8];
-        let img = decode_image(&doc, &dict, &raw, &Dictionary::new()).unwrap();
+        let img = decode_image(&doc, &dict, &raw, &Dictionary::new(), None).unwrap();
         assert_eq!(img.texel(0, 0).0, [255, 0, 0]);
         assert_eq!(img.texel(1, 0).0, [0, 0, 255]);
     }
@@ -920,7 +973,7 @@ mod tests {
         dict.set("ImageMask", Object::Boolean(true));
         // ビット列 0b01 → px0=0(塗る), px1=1(透明)。
         let raw = vec![0b0100_0000u8];
-        let img = decode_image(&doc, &dict, &raw, &Dictionary::new()).unwrap();
+        let img = decode_image(&doc, &dict, &raw, &Dictionary::new(), None).unwrap();
         let stencil = img.stencil.as_ref().unwrap();
         assert_eq!(stencil.len(), 2);
         assert!(stencil[0], "px0 は塗る");
@@ -946,7 +999,7 @@ mod tests {
             Object::Array(vec![Object::Real(1.0), Object::Real(0.0)]),
         );
         let raw = vec![0b0100_0000u8];
-        let img = decode_image(&doc, &dict, &raw, &Dictionary::new()).unwrap();
+        let img = decode_image(&doc, &dict, &raw, &Dictionary::new(), None).unwrap();
         let stencil = img.stencil.as_ref().unwrap();
         // 反転: px0=0→透明, px1=1→塗る。
         assert!(!stencil[0]);
@@ -973,7 +1026,7 @@ mod tests {
         dict.set("ColorSpace", Object::name("DeviceRGB"));
         dict.set("SMask", Object::Stream(smask));
         let raw = vec![255u8, 0, 0, 0, 255, 0];
-        let img = decode_image(&doc, &dict, &raw, &Dictionary::new()).unwrap();
+        let img = decode_image(&doc, &dict, &raw, &Dictionary::new(), None).unwrap();
         // 両ピクセルのアルファが 128 になる。
         assert_eq!(img.texel(0, 0).1, 128);
         assert_eq!(img.texel(1, 0).1, 128);
@@ -989,7 +1042,7 @@ mod tests {
         dict.set("Height", Object::Integer(2));
         dict.set("BitsPerComponent", Object::Integer(3));
         dict.set("ColorSpace", Object::name("DeviceGray"));
-        assert!(decode_image(&doc, &dict, &[0u8], &Dictionary::new()).is_none());
+        assert!(decode_image(&doc, &dict, &[0u8], &Dictionary::new(), None).is_none());
 
         // 長さ不足のデータ（2x2 RGB だが 1 バイトしかない）→ 縮退して 0 埋め。
         let mut dict2 = Dictionary::new();
@@ -997,7 +1050,7 @@ mod tests {
         dict2.set("Height", Object::Integer(2));
         dict2.set("BitsPerComponent", Object::Integer(8));
         dict2.set("ColorSpace", Object::name("DeviceRGB"));
-        let img = decode_image(&doc, &dict2, &[1u8], &Dictionary::new());
+        let img = decode_image(&doc, &dict2, &[1u8], &Dictionary::new(), None);
         assert!(img.is_some()); // 縮退でも Some
     }
 
@@ -1010,7 +1063,7 @@ mod tests {
         dict.set("Height", Object::Integer(100000));
         dict.set("BitsPerComponent", Object::Integer(8));
         dict.set("ColorSpace", Object::name("DeviceGray"));
-        assert!(decode_image(&doc, &dict, &[], &Dictionary::new()).is_none());
+        assert!(decode_image(&doc, &dict, &[], &Dictionary::new(), None).is_none());
     }
 
     /// 逆行列: 恒等は恒等、特異は None。

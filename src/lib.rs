@@ -95,6 +95,6 @@ pub use error::{PdfError, Result};
 pub use font::StandardFont;
 pub use interactive::{Destination, Link, LinkTarget, OutlineItem};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
-pub use render::Pixmap;
+pub use render::{Pixmap, RenderOptions, RenderQuality};
 pub use text::TextSpan;
 pub use truetype::TrueTypeFont;

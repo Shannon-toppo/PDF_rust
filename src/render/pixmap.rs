@@ -36,6 +36,20 @@ impl Pixmap {
         }
     }
 
+    /// サイズを変更して全面を不透明な白に戻す（バッファは可能な限り再利用）。
+    ///
+    /// [`crate::Document::render_page_into`] の出力先再利用のための補助。
+    /// 幅・高さが 0 の場合は [`new`](Self::new) と同様に 1 へ切り上げる。
+    pub fn reset(&mut self, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let len = (width as usize) * (height as usize) * 4;
+        self.width = width;
+        self.height = height;
+        self.data.clear();
+        self.data.resize(len, 0xFF);
+    }
+
     /// 幅（ピクセル）。
     pub fn width(&self) -> u32 {
         self.width

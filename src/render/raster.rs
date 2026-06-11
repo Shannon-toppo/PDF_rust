@@ -163,13 +163,31 @@ pub fn fill_path(
     alpha: u8,
     clip: Option<&Mask>,
 ) {
+    fill_path_aa(pm, path, rule, rgb, alpha, clip, SUBSAMPLES);
+}
+
+/// [`fill_path`] のサブスキャン本数指定版。
+///
+/// `subsamples` は縦方向のスーパーサンプリング係数（1–16 にクランプ）。
+/// 1 にすると縦の AA を省いて高速化できる（横は常に解析的被覆）。
+/// 通常品質は [`fill_path`]（= 4）を使う。
+#[allow(clippy::too_many_arguments)]
+pub fn fill_path_aa(
+    pm: &mut Pixmap,
+    path: &Path,
+    rule: FillRule,
+    rgb: [u8; 3],
+    alpha: u8,
+    clip: Option<&Mask>,
+    subsamples: u32,
+) {
     if alpha == 0 {
         return;
     }
     let width = pm.width();
     let height = pm.height();
     let base = alpha as u32;
-    rasterize(path, rule, width, height, |x, y, cov| {
+    rasterize_with(path, rule, width, height, subsamples, |x, y, cov| {
         let mut a = (cov as u32 * base + 127) / 255;
         if let Some(mask) = clip {
             a = (a * mask.coverage(x, y) as u32 + 127) / 255;
@@ -180,7 +198,7 @@ pub fn fill_path(
     });
 }
 
-/// 縦方向のサブスキャンライン本数（スーパーサンプリング係数）。
+/// 縦方向のサブスキャンライン本数（スーパーサンプリング係数）の既定値。
 const SUBSAMPLES: u32 = 4;
 
 /// パスをラスタライズし、被覆率が 0 でないピクセルごとに `emit(x, y, cov)` を呼ぶ。
@@ -193,8 +211,21 @@ fn rasterize<F: FnMut(u32, u32, u8)>(
     rule: FillRule,
     width: u32,
     height: u32,
+    emit: F,
+) {
+    rasterize_with(path, rule, width, height, SUBSAMPLES, emit);
+}
+
+/// [`rasterize`] のサブスキャン本数指定版（1–16 にクランプ）。
+fn rasterize_with<F: FnMut(u32, u32, u8)>(
+    path: &Path,
+    rule: FillRule,
+    width: u32,
+    height: u32,
+    subsamples: u32,
     mut emit: F,
 ) {
+    let subsamples = subsamples.clamp(1, 16);
     // 平坦化（デバイス空間なのでトレランスはピクセル単位）。
     let polylines = path.flatten(0.25);
     if polylines.is_empty() {
@@ -233,19 +264,19 @@ fn rasterize<F: FnMut(u32, u32, u8)>(
     }
 
     let w = width as usize;
-    // 1 行分のカバレッジ累積（サブスキャン合計、最大 255*SUBSAMPLES）。
+    // 1 行分のカバレッジ累積（サブスキャン合計、最大 255*subsamples）。
     let mut cover = vec![0u32; w];
     // サブスキャンの交点 (x, winding_dir) を貯めるバッファ。
     let mut xs: Vec<(f64, i32)> = Vec::new();
 
-    let sub_step = 1.0 / SUBSAMPLES as f64;
+    let sub_step = 1.0 / subsamples as f64;
     let max_per_pixel = 255u32; // 各サブスキャンの水平被覆の最大寄与（正規化前）
 
     for py in y_start..y_end {
         for c in cover.iter_mut() {
             *c = 0;
         }
-        for s in 0..SUBSAMPLES {
+        for s in 0..subsamples {
             let sy = py as f64 + (s as f64 + 0.5) * sub_step;
             xs.clear();
             for e in &edges {
@@ -280,8 +311,8 @@ fn rasterize<F: FnMut(u32, u32, u8)>(
             if c == 0 {
                 continue;
             }
-            // c は最大 255*SUBSAMPLES。SUBSAMPLES で割って 0–255 へ。
-            let cov = (c / SUBSAMPLES).min(255) as u8;
+            // c は最大 255*subsamples。subsamples で割って 0–255 へ。
+            let cov = (c / subsamples).min(255) as u8;
             if cov > 0 {
                 emit(x as u32, py as u32, cov);
             }

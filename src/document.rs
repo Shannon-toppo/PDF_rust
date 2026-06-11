@@ -486,20 +486,100 @@ impl Document {
         crate::text::extract_page_text_spans(self, page_id)
     }
 
+    /// ページの論理サイズ（ポイント単位、`/Rotate` 反映済み）を `(幅, 高さ)` で返す。
+    ///
+    /// `/MediaBox` を正規化したサイズで、回転が 90/270 度なら幅と高さを
+    /// 入れ替えて返す。[`render_page`](Self::render_page) を `scale` 倍で
+    /// 呼んだときのデバイスピクセルサイズは、この値の `scale` 倍（切り上げ）
+    /// になる。DPI 指定でレンダリングしたい場合は `scale = dpi / 72.0`
+    /// （例: 144dpi → 2.0）。
+    pub fn page_size(&self, index: usize) -> Result<(f64, f64)> {
+        let page_id = self.page_id(index)?;
+        let mb = self.page_media_box(page_id);
+        let page_w = (mb[2] - mb[0]).abs().max(1.0);
+        let page_h = (mb[3] - mb[1]).abs().max(1.0);
+        let rotate = self.page_rotation(page_id);
+        if rotate == 90 || rotate == 270 {
+            Ok((page_h, page_w))
+        } else {
+            Ok((page_w, page_h))
+        }
+    }
+
+    /// ページの `/Rotate`（継承込み）を 0/90/180/270 へ正規化して返す。
+    fn page_rotation(&self, page_id: ObjectId) -> i64 {
+        let rotate = self
+            .page_attr(page_id, "Rotate")
+            .and_then(|o| o.as_int().ok())
+            .unwrap_or(0)
+            .rem_euclid(360);
+        (rotate / 90 * 90).rem_euclid(360) // 90 の倍数でない値は切り捨て
+    }
+
     /// ページをラスタライズして RGBA ピクセルバッファを返す。
     ///
-    /// `scale` は 72dpi を 1.0 とする拡大率（2.0 ≒ 144dpi）。ページの
-    /// `/MediaBox` と `/Rotate`（継承込み）を反映する。塗り・線・クリップ・
-    /// Form XObject・画像（XObject / インライン）・テキスト（TrueType グリフ）・
-    /// 注釈の外観ストリーム（`/AP` `/N`）を解釈する。テキストは埋め込み
-    /// TrueType（`/FontFile2`）と非埋め込みのシステムフォント代替
-    /// （`C:\Windows\Fonts`）に対応し、CFF（`.otf`）・Type1 フォントは
-    /// 描画しない（字送りのみ）。
+    /// `scale` は 72dpi を 1.0 とする拡大率（`dpi / 72.0` で換算。2.0 ≒ 144dpi）。
+    /// ページの `/MediaBox` と `/Rotate`（継承込み）を反映する。塗り・線・
+    /// クリップ・Form XObject・画像（XObject / インライン）・テキスト
+    /// （TrueType グリフ）・注釈の外観ストリーム（`/AP` `/N`）を解釈する。
+    /// テキストは埋め込み TrueType（`/FontFile2`）と非埋め込みのシステム
+    /// フォント代替（`C:\Windows\Fonts`）に対応し、CFF（`.otf`）・Type1
+    /// フォントは描画しない（字送りのみ）。
     ///
     /// 壊れたコンテントや未対応機能は読み飛ばして「描けるだけ描く」。
     /// コンテントの解析に失敗しても空ページ（背景白）を返し、`Err` にしない。
+    ///
+    /// 領域（タイル）指定・協調キャンセル・品質切替などの制御は
+    /// [`render_page_with`](Self::render_page_with) を使う（本メソッドは
+    /// その薄いラッパ）。
     pub fn render_page(&self, index: usize, scale: f64) -> Result<crate::render::Pixmap> {
-        use crate::render::{Matrix, Pixmap, Renderer};
+        self.render_page_with(
+            index,
+            &crate::render::RenderOptions {
+                scale,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// オプション指定でページをラスタライズして RGBA ピクセルバッファを返す。
+    ///
+    /// 描画内容と耐故障性は [`render_page`](Self::render_page) と同じ。
+    /// [`crate::render::RenderOptions`] で領域（タイル）レンダリング・協調
+    /// キャンセル・注釈の ON/OFF・品質切替を制御できる。キャンセルされた
+    /// 場合は部分結果を返さず [`PdfError::Cancelled`] を返す。
+    pub fn render_page_with(
+        &self,
+        index: usize,
+        options: &crate::render::RenderOptions,
+    ) -> Result<crate::render::Pixmap> {
+        let mut pm = crate::render::Pixmap::new(1, 1);
+        self.render_page_into(index, options, &mut pm)?;
+        Ok(pm)
+    }
+
+    /// 既存の [`Pixmap`](crate::render::Pixmap) を出力先に再利用してページを
+    /// ラスタライズする。
+    ///
+    /// 連続レンダリング（ズーム・スクロール時の再描画）でバッファの再確保を
+    /// 避けるための [`render_page_with`](Self::render_page_with) の変種。
+    /// `pm` は内部でサイズ変更（白で初期化）されるため、呼び出し前のサイズは
+    /// 一致していなくてよい。`Err` を返した場合（キャンセル含む）の `pm` の
+    /// 内容は未定義（部分描画が残りうる）。
+    pub fn render_page_into(
+        &self,
+        index: usize,
+        options: &crate::render::RenderOptions,
+        pm: &mut crate::render::Pixmap,
+    ) -> Result<()> {
+        use crate::render::{Matrix, Renderer};
+
+        // 開始前のキャンセル確認（フラグが立っていれば何も描かない）。
+        if let Some(c) = &options.cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(PdfError::Cancelled);
+            }
+        }
 
         let page_id = self.page_id(index)?;
 
@@ -507,59 +587,75 @@ impl Document {
         let mb = self.page_media_box(page_id);
         let x0 = mb[0].min(mb[2]);
         let y0 = mb[1].min(mb[3]);
-        let x1 = mb[0].max(mb[2]);
-        let y1 = mb[1].max(mb[3]);
-        let page_w = (x1 - x0).max(1.0);
-        let page_h = (y1 - y0).max(1.0);
+        let page_w = (mb[2] - mb[0]).abs().max(1.0);
+        let page_h = (mb[3] - mb[1]).abs().max(1.0);
 
-        // Rotate を 0/90/180/270 へ正規化（負値・360 超も対応）。
-        let rotate = self
-            .page_attr(page_id, "Rotate")
-            .and_then(|o| o.as_int().ok())
-            .unwrap_or(0)
-            .rem_euclid(360);
-        let rotate = (rotate / 90 * 90).rem_euclid(360); // 90 の倍数でない値は切り捨て
+        let rotate = self.page_rotation(page_id);
 
         // スケールの補正。
-        let mut scale = if scale.is_finite() && scale > 0.0 {
-            scale
+        let mut scale = if options.scale.is_finite() && options.scale > 0.0 {
+            options.scale
         } else {
             1.0
-        };
-
-        // デバイスサイズ（回転で幅高さ交換）。
-        let (dev_w_f, dev_h_f) = if rotate == 90 || rotate == 270 {
-            (page_h * scale, page_w * scale)
-        } else {
-            (page_w * scale, page_h * scale)
         };
 
         // ピクセル数の上限ガード（長辺 10000・総面積 1 億）。
         const MAX_SIDE: f64 = 10000.0;
         const MAX_AREA: f64 = 100_000_000.0;
-        let longest = dev_w_f.max(dev_h_f);
-        if longest > MAX_SIDE {
-            scale *= MAX_SIDE / longest;
-        }
-        let area = (page_w * scale) * (page_h * scale);
-        if area > MAX_AREA {
-            scale *= (MAX_AREA / area).sqrt();
-        }
 
-        // 最終デバイスサイズ。
-        let (dev_w, dev_h) = if rotate == 90 || rotate == 270 {
-            (
-                (page_h * scale).ceil().max(1.0) as u32,
-                (page_w * scale).ceil().max(1.0) as u32,
-            )
-        } else {
-            (
-                (page_w * scale).ceil().max(1.0) as u32,
-                (page_h * scale).ceil().max(1.0) as u32,
-            )
+        // 出力ピクセルサイズと、デバイス空間での平行移動（タイルの左上）。
+        let (dev_w, dev_h, tile_tx, tile_ty) = match options.region {
+            None => {
+                // 全面: ガードはスケールを縮めて適用する（従来挙動）。
+                let (dev_w_f, dev_h_f) = if rotate == 90 || rotate == 270 {
+                    (page_h * scale, page_w * scale)
+                } else {
+                    (page_w * scale, page_h * scale)
+                };
+                let longest = dev_w_f.max(dev_h_f);
+                if longest > MAX_SIDE {
+                    scale *= MAX_SIDE / longest;
+                }
+                let area = (page_w * scale) * (page_h * scale);
+                if area > MAX_AREA {
+                    scale *= (MAX_AREA / area).sqrt();
+                }
+                let (w, h) = if rotate == 90 || rotate == 270 {
+                    (
+                        (page_h * scale).ceil().max(1.0) as u32,
+                        (page_w * scale).ceil().max(1.0) as u32,
+                    )
+                } else {
+                    (
+                        (page_w * scale).ceil().max(1.0) as u32,
+                        (page_h * scale).ceil().max(1.0) as u32,
+                    )
+                };
+                (w, h, 0.0, 0.0)
+            }
+            Some([rx, ry, rw, rh]) => {
+                // タイル: スケールは縮めず（深いズームが目的）、タイル自体の
+                // 大きさにのみガードをかける。
+                if !(rx.is_finite() && ry.is_finite() && rw.is_finite() && rh.is_finite()) {
+                    return Err(PdfError::Invalid("render region must be finite".into()));
+                }
+                if rw <= 0.0 || rh <= 0.0 {
+                    return Err(PdfError::Invalid(
+                        "render region must have positive size".into(),
+                    ));
+                }
+                let mut rw = rw.min(MAX_SIDE);
+                let mut rh = rh.min(MAX_SIDE);
+                if rw * rh > MAX_AREA {
+                    let shrink = (MAX_AREA / (rw * rh)).sqrt();
+                    rw *= shrink;
+                    rh *= shrink;
+                }
+                (rw.ceil().max(1.0) as u32, rh.ceil().max(1.0) as u32, rx, ry)
+            }
         };
 
-        let mut pm = Pixmap::new(dev_w, dev_h);
+        pm.reset(dev_w, dev_h);
 
         // 基底 CTM の構成。
         //
@@ -615,34 +711,56 @@ impl Document {
         };
         let base_ctm = origin.then(&rot);
 
+        // タイル指定なら基底 CTM の後段にタイル左上への平行移動を合成する。
+        // 全面レンダ結果から同領域を切り出したものとピクセル一致する。
+        let base_ctm = if options.region.is_some() {
+            base_ctm.then(&Matrix::translate(-tile_tx, -tile_ty))
+        } else {
+            base_ctm
+        };
+
         // コンテントを解析して描画。解析失敗時も注釈は描く（描けるだけ描く）。
         let resources = self.page_resources(page_id);
-        let mut renderer = Renderer::new(self, &mut pm, base_ctm);
+        let mut renderer = Renderer::new(self, pm, base_ctm);
+        renderer.set_cancel_flag(options.cancel.clone());
+        renderer.set_quality(options.quality);
         if let Ok(bytes) = self.page_content_bytes(page_id) {
             if let Ok(ops) = crate::content::parse_content(&bytes) {
                 renderer.run(&ops, &resources);
             }
         }
+        if renderer.is_cancelled() {
+            return Err(PdfError::Cancelled);
+        }
 
         // 注釈の外観ストリーム（/AP /N）をページ内容の上に描画する。
-        let annots: Vec<Dictionary> = match self
-            .get_object(page_id)
-            .ok()
-            .and_then(|o| o.as_dict().ok())
-            .and_then(|d| self.dict_get(d, "Annots"))
-        {
-            Some(Object::Array(a)) => a
-                .iter()
-                .filter_map(|o| self.resolve(o).as_dict().ok().cloned())
-                .collect(),
-            _ => Vec::new(),
-        };
-        for annot in &annots {
-            renderer.draw_annotation(annot, &resources);
+        if options.annotations {
+            let annots: Vec<Dictionary> = match self
+                .get_object(page_id)
+                .ok()
+                .and_then(|o| o.as_dict().ok())
+                .and_then(|d| self.dict_get(d, "Annots"))
+            {
+                Some(Object::Array(a)) => a
+                    .iter()
+                    .filter_map(|o| self.resolve(o).as_dict().ok().cloned())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for annot in &annots {
+                if renderer.is_cancelled() {
+                    break;
+                }
+                renderer.draw_annotation(annot, &resources);
+            }
         }
+        let cancelled = renderer.is_cancelled();
         drop(renderer);
+        if cancelled {
+            return Err(PdfError::Cancelled);
+        }
 
-        Ok(pm)
+        Ok(())
     }
 }
 

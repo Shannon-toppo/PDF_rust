@@ -760,3 +760,276 @@ fn render_jpeg_image_xobject() {
         exp
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7: レンダリング性能・制御（RenderOptions）
+// ---------------------------------------------------------------------------
+
+use pdf_rust::{PdfError, RenderOptions, RenderQuality};
+
+/// テスト用: 矩形・斜め線・ベジェ・テキストを含むページを作る。
+fn build_mixed_page() -> Document {
+    let mut doc = Document::new();
+    doc.add_page(200.0, 150.0).unwrap();
+    doc.draw_rect(
+        0,
+        30.0,
+        40.0,
+        80.0,
+        50.0,
+        &DrawOptions {
+            stroke_color: (0.0, 0.0, 1.0),
+            fill_color: Some((0.9, 0.3, 0.1)),
+            line_width: 2.0,
+        },
+    )
+    .unwrap();
+    doc.draw_line(
+        0,
+        (10.0, 10.0),
+        (190.0, 140.0),
+        &DrawOptions {
+            stroke_color: (0.0, 0.5, 0.0),
+            line_width: 3.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // ベジェ曲線（生コンテント）。
+    doc.append_content_bytes(
+        0,
+        b"q 0 0 0 RG 2 w 20 100 m 60 140 140 60 180 100 c S Q".to_vec(),
+    )
+    .unwrap();
+    doc.add_text(
+        0,
+        "Tile",
+        &TextOptions {
+            size: 24.0,
+            x: 60.0,
+            y: 110.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    doc
+}
+
+/// 全面レンダ結果から領域を切り出した結果と、region 指定のタイルレンダが
+/// ピクセル一致する（浮動小数の丸め揺れとして各チャンネル ±1 まで許容）。
+#[test]
+fn render_region_matches_full_crop() {
+    let doc = build_mixed_page();
+    let opts_full = RenderOptions {
+        scale: 2.0,
+        ..Default::default()
+    };
+    let full = doc.render_page_with(0, &opts_full).unwrap();
+
+    // ページ中央のタイル [x=100, y=80, w=120, h=90]。
+    let (rx, ry, rw, rh) = (100u32, 80u32, 120u32, 90u32);
+    let opts_tile = RenderOptions {
+        scale: 2.0,
+        region: Some([rx as f64, ry as f64, rw as f64, rh as f64]),
+        ..Default::default()
+    };
+    let tile = doc.render_page_with(0, &opts_tile).unwrap();
+    assert_eq!((tile.width(), tile.height()), (rw, rh));
+
+    let mut max_diff = 0i32;
+    for y in 0..rh {
+        for x in 0..rw {
+            let a = tile.pixel(x, y).unwrap();
+            let b = full.pixel(rx + x, ry + y).unwrap();
+            for i in 0..3 {
+                max_diff = max_diff.max((a[i] as i32 - b[i] as i32).abs());
+            }
+        }
+    }
+    assert!(
+        max_diff <= 1,
+        "タイルと全面切り出しの最大差 {} が 1 を超えた",
+        max_diff
+    );
+}
+
+/// ページ外にはみ出した領域は白のまま、ページ内部分は一致する。
+#[test]
+fn render_region_outside_page_is_white() {
+    let doc = build_mixed_page();
+    // ページは 200x150 @ scale 1.0。右下へはみ出すタイル。
+    let opts = RenderOptions {
+        region: Some([180.0, 130.0, 40.0, 40.0]),
+        ..Default::default()
+    };
+    let tile = doc.render_page_with(0, &opts).unwrap();
+    assert_eq!((tile.width(), tile.height()), (40, 40));
+    // ページ外（タイル内座標 (30, 30) = デバイス (210, 160)）は白。
+    assert_eq!(tile.pixel(30, 30), Some([255, 255, 255]));
+}
+
+/// 不正な領域（負サイズ・非有限）は Err。
+#[test]
+fn render_region_invalid_rejected() {
+    let doc = build_mixed_page();
+    for region in [
+        [0.0, 0.0, -10.0, 10.0],
+        [0.0, 0.0, 10.0, 0.0],
+        [f64::NAN, 0.0, 10.0, 10.0],
+    ] {
+        let opts = RenderOptions {
+            region: Some(region),
+            ..Default::default()
+        };
+        assert!(
+            doc.render_page_with(0, &opts).is_err(),
+            "region {:?} が拒否されない",
+            region
+        );
+    }
+}
+
+/// 協調キャンセル: フラグを事前に立てると PdfError::Cancelled が返る。
+#[test]
+fn render_cancel_returns_cancelled() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let doc = build_mixed_page();
+    let flag = Arc::new(AtomicBool::new(true));
+    let opts = RenderOptions {
+        cancel: Some(flag.clone()),
+        ..Default::default()
+    };
+    match doc.render_page_with(0, &opts) {
+        Err(PdfError::Cancelled) => {}
+        other => panic!("Cancelled が返らない: {other:?}"),
+    }
+
+    // フラグを下ろせば普通に描ける。
+    flag.store(false, Ordering::Relaxed);
+    assert!(doc.render_page_with(0, &opts).is_ok());
+}
+
+/// render_page_into: バッファ再利用でも render_page_with と全ピクセル一致。
+/// サイズ不一致のバッファを渡しても内部で作り直される。
+#[test]
+fn render_into_reuses_buffer() {
+    let doc = build_mixed_page();
+    let opts = RenderOptions::default();
+    let expected = doc.render_page_with(0, &opts).unwrap();
+
+    // わざと違うサイズ + 汚れた内容のバッファを使い回す。
+    let mut pm = pdf_rust::Pixmap::new(10, 10);
+    pm.fill([0, 0, 0]);
+    doc.render_page_into(0, &opts, &mut pm).unwrap();
+    assert_eq!(
+        (pm.width(), pm.height()),
+        (expected.width(), expected.height())
+    );
+    assert_eq!(
+        pm.data(),
+        expected.data(),
+        "into の結果が with と一致しない"
+    );
+
+    // 同じバッファで 2 ページ目相当（同ページ再描画）も一致する。
+    doc.render_page_into(0, &opts, &mut pm).unwrap();
+    assert_eq!(pm.data(), expected.data());
+}
+
+/// annotations: false で注釈外観（/AP /N）が描かれない。
+#[test]
+fn render_annotations_toggle() {
+    let mut doc = Document::new();
+    let p0 = doc.add_page(200.0, 200.0).unwrap();
+
+    // 外観: BBox 全面を赤く塗る Form。
+    let mut ap_dict = Dictionary::new();
+    ap_dict.set("Type", Object::name("XObject"));
+    ap_dict.set("Subtype", Object::name("Form"));
+    ap_dict.set(
+        "BBox",
+        Object::Array(vec![0.into(), 0.into(), 10.into(), 10.into()]),
+    );
+    let ap_stream = Stream::new(ap_dict, b"1 0 0 rg 0 0 10 10 re f".to_vec());
+    let ap_id = doc.add_object(Object::Stream(ap_stream));
+    let mut n = Dictionary::new();
+    n.set("N", Object::Reference(ap_id));
+    let mut annot = Dictionary::new();
+    annot.set("Subtype", Object::name("Square"));
+    annot.set(
+        "Rect",
+        Object::Array(vec![80.into(), 80.into(), 120.into(), 120.into()]),
+    );
+    annot.set("AP", n);
+    let annot_id = doc.add_object(annot);
+    let page = doc.get_object_mut(p0).unwrap().as_dict_mut().unwrap();
+    page.set("Annots", Object::Array(vec![Object::Reference(annot_id)]));
+
+    // 既定（annotations: true）は描かれる。Rect 中心 (100,100) → デバイス (100, 100)。
+    let on = doc.render_page_with(0, &RenderOptions::default()).unwrap();
+    assert_eq!(
+        on.pixel(100, 100),
+        Some([255, 0, 0]),
+        "注釈が描かれていない"
+    );
+
+    // annotations: false で白のまま。
+    let off = doc
+        .render_page_with(
+            0,
+            &RenderOptions {
+                annotations: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(off.pixel(100, 100), Some([255, 255, 255]), "注釈が描かれた");
+}
+
+/// quality: Fast でも図形の内部（AA に依らない部分）は Normal と一致し、
+/// 全体としても描画が成立する。
+#[test]
+fn render_quality_fast() {
+    let doc = build_mixed_page();
+    let normal = doc.render_page_with(0, &RenderOptions::default()).unwrap();
+    let fast = doc
+        .render_page_with(
+            0,
+            &RenderOptions {
+                quality: RenderQuality::Fast,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (fast.width(), fast.height()),
+        (normal.width(), normal.height())
+    );
+    // 矩形内部（PDF (70, 65) → デバイス (70, 150-65=85)）は両方とも同じ塗り色。
+    assert_eq!(fast.pixel(70, 85), normal.pixel(70, 85));
+    // 外側の白も一致。
+    assert_eq!(fast.pixel(5, 70), Some([255, 255, 255]));
+}
+
+/// page_size: /Rotate 反映済みの論理サイズ（pt）を返す。
+#[test]
+fn page_size_reflects_rotation() {
+    let mut doc = Document::new();
+    doc.add_page(200.0, 150.0).unwrap();
+    assert_eq!(doc.page_size(0).unwrap(), (200.0, 150.0));
+
+    doc.rotate_page(0, 90).unwrap();
+    assert_eq!(doc.page_size(0).unwrap(), (150.0, 200.0));
+
+    doc.rotate_page(0, 90).unwrap(); // 計 180 度
+    assert_eq!(doc.page_size(0).unwrap(), (200.0, 150.0));
+
+    // render_page のデバイスサイズと整合する。
+    let pm = doc.render_page(0, 2.0).unwrap();
+    assert_eq!((pm.width(), pm.height()), (400, 300));
+
+    // 範囲外は Err。
+    assert!(doc.page_size(9).is_err());
+}
