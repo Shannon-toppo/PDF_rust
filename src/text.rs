@@ -558,6 +558,25 @@ pub struct TextSpan {
     pub bbox: [f64; 4],
     /// 実効フォントサイズ（テキスト行列・CTM のスケール込み、ポイント）。
     pub font_size: f64,
+    /// グリフ（コード）単位の境界箱列（テキスト選択・キャレット用）。
+    ///
+    /// 各要素の `text` を連結したものが [`text`](Self::text) と一致する。
+    /// 幅はフォントメトリクスの advance から、高さはスパンと同じ
+    /// アセント/ディセントから推定する（グリフ実測ではない）。
+    pub glyphs: Vec<SpanGlyph>,
+}
+
+/// [`TextSpan`] 内の 1 グリフ（1 文字コード）分の位置情報。
+///
+/// 座標系は [`TextSpan::bbox`] と同じページのユーザー空間。合字や
+/// 多バイトコードでは `text` が複数文字になることがあり、ToUnicode で
+/// 対応が引けないコードでは空文字列になることもある。
+#[derive(Debug, Clone)]
+pub struct SpanGlyph {
+    /// このコードのデコード結果。
+    pub text: String,
+    /// 軸平行境界箱 `[x0, y0, x1, y1]`（x0<x1, y0<y1）。
+    pub bbox: [f64; 4],
 }
 
 /// ページの位置付きテキストスパンを抽出する。
@@ -728,8 +747,9 @@ fn spans_from_content(
                     let decoder = span_decoder(&decoders, &gs.font);
                     let mut text = String::new();
                     let mut tx = 0.0;
-                    span_string_metrics(decoder, bytes, &gs, &mut text, &mut tx);
-                    push_span(out, decoder, &gs, &tm, tx, text);
+                    let mut glyphs = Vec::new();
+                    span_string_metrics(decoder, bytes, &gs, &mut text, &mut tx, &mut glyphs);
+                    push_span(out, decoder, &gs, &tm, tx, text, glyphs);
                     tm = Matrix::translate(tx, 0.0).then(&tm);
                 }
             }
@@ -741,10 +761,18 @@ fn spans_from_content(
                 let decoder = span_decoder(&decoders, &gs.font);
                 let mut text = String::new();
                 let mut tx = 0.0;
+                let mut glyphs = Vec::new();
                 for item in items {
                     match item {
                         Object::String(bytes, _) => {
-                            span_string_metrics(decoder, bytes, &gs, &mut text, &mut tx);
+                            span_string_metrics(
+                                decoder,
+                                bytes,
+                                &gs,
+                                &mut text,
+                                &mut tx,
+                                &mut glyphs,
+                            );
                         }
                         Object::Integer(_) | Object::Real(_) => {
                             let adj = item.as_number().unwrap_or(0.0);
@@ -753,7 +781,7 @@ fn spans_from_content(
                         _ => {}
                     }
                 }
-                push_span(out, decoder, &gs, &tm, tx, text);
+                push_span(out, decoder, &gs, &tm, tx, text, glyphs);
                 tm = Matrix::translate(tx, 0.0).then(&tm);
             }
             "Do" => {
@@ -812,43 +840,34 @@ fn span_decoder<'a>(
 /// 表示文字列 1 つ分のテキストと advance（テキスト空間）を累積する。
 ///
 /// 幅不明のコードは 500/1000 em とみなす（bbox を返せることを優先）。
+/// `glyphs` にはコードごとの `(デコード結果, 開始 tx, 終了 tx)` を積む
+/// （グリフ単位境界箱の素材。tx はテキスト空間）。
 fn span_string_metrics(
     decoder: &FontDecoder,
     bytes: &[u8],
     gs: &SpanState,
     text: &mut String,
     tx: &mut f64,
+    glyphs: &mut Vec<(String, f64, f64)>,
 ) {
     for code in decoder.codes(bytes) {
-        decoder.decode_code(code, text);
+        let mut gtext = String::new();
+        decoder.decode_code(code, &mut gtext);
         let w0 = decoder.code_width(code).unwrap_or(500.0);
         let mut adv = w0 / 1000.0 * gs.font_size + gs.char_spacing;
         if !decoder.two_byte && code == 32 {
             adv += gs.word_spacing;
         }
+        let tx0 = *tx;
         *tx += adv * gs.h_scale / 100.0;
+        text.push_str(&gtext);
+        glyphs.push((gtext, tx0, *tx));
     }
 }
 
-/// スパン 1 つを構築して `out` へ追加する（テキストが空なら何もしない）。
-///
-/// `tm` はスパン開始時点のテキスト行列、`tx` は表示全体の advance
-/// （テキスト空間。`TJ` の字送り調整込み）。
-fn push_span(
-    out: &mut Vec<TextSpan>,
-    decoder: &FontDecoder,
-    gs: &SpanState,
-    tm: &Matrix,
-    tx: f64,
-    text: String,
-) {
-    if text.is_empty() {
-        return;
-    }
-    let trm = tm.then(&gs.ctm); // テキスト空間 → ページ空間
-    let y0 = decoder.descent * gs.font_size + gs.rise;
-    let y1 = decoder.ascent * gs.font_size + gs.rise;
-    let (x0, x1) = (0.0_f64.min(tx), 0.0_f64.max(tx));
+/// テキスト空間の矩形 `[x0, x1] × [y0, y1]` を `trm` で写した軸平行境界箱。
+/// 非有限が混ざる場合は `None`。
+fn text_rect_aabb(trm: &Matrix, x0: f64, x1: f64, y0: f64, y1: f64) -> Option<[f64; 4]> {
     let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
     let mut bx0 = f64::INFINITY;
     let mut by0 = f64::INFINITY;
@@ -861,9 +880,46 @@ fn push_span(
         bx1 = bx1.max(p.x);
         by1 = by1.max(p.y);
     }
-    if !(bx0.is_finite() && by0.is_finite() && bx1.is_finite() && by1.is_finite()) {
-        return; // 行列が壊れている（非有限）スパンは捨てる
+    if bx0.is_finite() && by0.is_finite() && bx1.is_finite() && by1.is_finite() {
+        Some([bx0, by0, bx1, by1])
+    } else {
+        None
     }
+}
+
+/// スパン 1 つを構築して `out` へ追加する（テキストが空なら何もしない）。
+///
+/// `tm` はスパン開始時点のテキスト行列、`tx` は表示全体の advance
+/// （テキスト空間。`TJ` の字送り調整込み）、`glyphs` はコードごとの
+/// `(テキスト, 開始 tx, 終了 tx)`。
+fn push_span(
+    out: &mut Vec<TextSpan>,
+    decoder: &FontDecoder,
+    gs: &SpanState,
+    tm: &Matrix,
+    tx: f64,
+    text: String,
+    glyphs: Vec<(String, f64, f64)>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let trm = tm.then(&gs.ctm); // テキスト空間 → ページ空間
+    let y0 = decoder.descent * gs.font_size + gs.rise;
+    let y1 = decoder.ascent * gs.font_size + gs.rise;
+    let (x0, x1) = (0.0_f64.min(tx), 0.0_f64.max(tx));
+    let bbox = match text_rect_aabb(&trm, x0, x1, y0, y1) {
+        Some(b) => b,
+        None => return, // 行列が壊れている（非有限）スパンは捨てる
+    };
+    // グリフ単位の境界箱（スパンと同じ高さで advance 区間を写す）。
+    let span_glyphs: Vec<SpanGlyph> = glyphs
+        .into_iter()
+        .filter_map(|(gtext, gx0, gx1)| {
+            let (gx0, gx1) = (gx0.min(gx1), gx0.max(gx1));
+            text_rect_aabb(&trm, gx0, gx1, y0, y1).map(|bbox| SpanGlyph { text: gtext, bbox })
+        })
+        .collect();
     // 実効フォントサイズ: テキスト空間の単位縦ベクトル (0,1) の像の長さ。
     let v = (trm.c * trm.c + trm.d * trm.d).sqrt();
     let font_size = if v.is_finite() && v > 0.0 {
@@ -873,8 +929,9 @@ fn push_span(
     };
     out.push(TextSpan {
         text,
-        bbox: [bx0, by0, bx1, by1],
+        bbox,
         font_size,
+        glyphs: span_glyphs,
     });
 }
 

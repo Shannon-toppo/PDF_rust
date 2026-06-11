@@ -98,7 +98,9 @@ doc.save("edited.pdf")?;     // 完全書き直しで保存
 | `doc.page_content_bytes(id)` | 全コンテントストリームを伸長して連結 |
 | `doc.page_resources(id)` | 実効 `/Resources` 辞書 |
 | `doc.extract_text(index)` | テキスト抽出 |
-| `doc.extract_text_spans(index)` | 位置付きテキスト抽出。`Vec<TextSpan { text, bbox, font_size }>`（テキスト選択・検索ハイライト用。bbox はユーザー空間） |
+| `doc.extract_text_spans(index)` | 位置付きテキスト抽出。`Vec<TextSpan { text, bbox, font_size, glyphs }>`（テキスト選択・検索ハイライト用。bbox はユーザー空間）。`glyphs` はグリフ（コード）単位の `SpanGlyph { text, bbox }` 列で、連結するとスパンの `text` に一致する |
+| `doc.search_page(index, query, &SearchOptions)` | ページ内テキスト検索。`Vec<SearchHit { rects }>`（矩形は行ごとにマージ、行を跨ぐヒットは複数矩形）。`SearchOptions { case_insensitive }`。スパン跨ぎ・行跨ぎ（空白 1 個を仮定）に対応。正規表現は非対応 |
+| `doc.search(query, &SearchOptions)` | 全ページ検索。`Vec<(ページ番号, SearchHit)>` をページ順で返す |
 | `doc.render_page(index, scale)` | ページを `Pixmap`（RGBA）にラスタライズ（注釈の外観 `/AP` 込み）。`pixmap.save_png(path)` / `pixmap.to_png()` で PNG 化。`render_page_with` の薄いラッパ |
 | `doc.render_page_with(index, &RenderOptions)` | オプション付きラスタライズ。`RenderOptions { scale, region, cancel, annotations, quality }` で領域（タイル）レンダリング・協調キャンセル（`PdfError::Cancelled`）・注釈の ON/OFF・品質切替（`Fast` = AA 1x + 最近傍補間）を制御 |
 | `doc.render_page_into(index, &RenderOptions, &mut Pixmap)` | 出力先 `Pixmap` を再利用する変種（連続レンダリングでの再確保回避。サイズ不一致は内部で作り直す） |
@@ -388,6 +390,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `content` | コンテントストリーム ⇔ `Operation` 列の相互変換。インライン画像は辞書 + 生データとして保持 |
 | `text` | テキスト抽出。ToUnicode CMap（bfchar/bfrange）、Form XObject 再帰、改行/空白ヒューリスティック、位置付きスパン抽出（`TextSpan`） |
 | `interactive` | ビューワー機能。しおり（/Outlines）、リンク注釈、宛先解決（明示配列・名前付き）、ページラベル（/PageLabels 数値ツリー） |
+| `search` | テキスト検索。スパン連結（境界箱中心による同一行判定 + 隙間/行境界への空白仮定）→ リテラル照合 → 行ごとのハイライト矩形マージ |
 | `font` | 標準 14 フォントの幅テーブル（AFM 由来）、WinAnsi ⇔ Unicode |
 | `truetype` | TTF/TTC パーサ。cmap format 4/12、hmtx/head/hhea/maxp/OS∕ 2/post/name/loca/glyf |
 | `subset` | TrueType サブセッタ。グリフ閉包（composite 対応）、sparse glyf、チェックサム再計算 |
@@ -421,7 +424,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 ### 4.3 テスト
 
 ```
-cargo test          # ユニット 198 + 統合 55 + doctest 3
+cargo test          # ユニット 206 + 統合 61 + doctest 3
 ```
 
 - フィルタは既知ベクタ（.NET `ZLibStream` で生成した zlib データ、
@@ -460,10 +463,12 @@ cargo test          # ユニット 198 + 統合 55 + doctest 3
 - ✅ 色空間: DeviceGray/RGB/CMYK、Indexed、ICCBased（/N・/Alternate 近似）、
   Separation/DeviceN（tint 変換 = PDF 関数 Type 0/2/3/4 インタプリタ）、
   CalGray/CalRGB（Device 同一視）、Lab（近似変換）
-- ✅ ビューワー機能: 位置付きテキスト抽出（`extract_text_spans`）、しおり
-  （`outlines`）、リンク注釈と宛先解決（`page_links`。明示配列・名前付き宛先）、
-  ページラベル（`page_label`）、注釈の外観描画（`/AP` `/N`。`/AS` 状態選択、
-  Hidden/NoView フラグ対応）
+- ✅ ビューワー機能: 位置付きテキスト抽出（`extract_text_spans`。グリフ単位
+  ボックス込み）、しおり（`outlines`）、リンク注釈と宛先解決（`page_links`。
+  明示配列・名前付き宛先）、ページラベル（`page_label`）、注釈の外観描画
+  （`/AP` `/N`。`/AS` 状態選択、Hidden/NoView フラグ対応）
+- ✅ テキスト検索: `search_page` / `search`（大文字小文字無視オプション、
+  スパン跨ぎ・行跨ぎマッチ、行ごとのハイライト矩形）
 
 ### 制限
 

@@ -28,8 +28,9 @@ doc.save("output.pdf")?;
 ## 主な機能
 
 - **閲覧**: ページ列挙、テキスト抽出（ToUnicode CMap 対応）、メタデータ取得
-- **ビューワー機能**: 位置付きテキスト抽出（`extract_text_spans`）、
-  しおり（`outlines`）、リンク注釈と宛先解決（`page_links`）、
+- **ビューワー機能**: 位置付きテキスト抽出（`extract_text_spans`。グリフ単位
+  ボックス込み）、テキスト検索（`search_page` / `search`。行跨ぎマッチ・
+  ハイライト矩形）、しおり（`outlines`）、リンク注釈と宛先解決（`page_links`）、
   ページラベル（`page_label`）
 - **編集**: テキスト・図形の描画、ページ追加/削除/回転、メタデータ編集
 - **日本語描画**: TrueType/TTC フォント埋め込み・自動サブセット化・Identity-H（`add_text_with_font`）

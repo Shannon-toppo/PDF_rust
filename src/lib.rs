@@ -48,6 +48,7 @@
 //! | [`content`] | コンテントストリームの解析・生成 |
 //! | [`function`] | PDF 関数インタプリタ（Type 0/2/3/4） |
 //! | [`text`] | テキスト抽出（ToUnicode CMap 対応・位置付きスパン） |
+//! | [`search`] | テキスト検索（スパン跨ぎ照合・行単位ハイライト矩形） |
 //! | [`interactive`] | しおり・リンク注釈・宛先解決・ページラベル |
 //! | [`font`] | 標準 14 フォントのメトリクスと WinAnsi 変換 |
 //! | [`encoding`] | 単純フォントのエンコーディング解決（Standard/MacRoman/グリフ名） |
@@ -81,6 +82,7 @@ pub mod lexer;
 pub mod object;
 pub mod parser;
 pub mod render;
+pub mod search;
 pub mod subset;
 pub mod text;
 pub mod truetype;
@@ -96,5 +98,6 @@ pub use font::StandardFont;
 pub use interactive::{Destination, Link, LinkTarget, OutlineItem};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
 pub use render::{Pixmap, RenderOptions, RenderQuality};
-pub use text::TextSpan;
+pub use search::{SearchHit, SearchOptions};
+pub use text::{SpanGlyph, TextSpan};
 pub use truetype::TrueTypeFont;
