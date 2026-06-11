@@ -475,14 +475,26 @@ impl Document {
         crate::text::extract_page_text(self, page_id)
     }
 
+    /// ページの位置付きテキストスパンを抽出する（`index` は 0 始まり）。
+    ///
+    /// テキスト選択・検索ハイライト用。1 つの表示演算（`Tj`/`TJ` 等）が
+    /// 1 つの [`crate::text::TextSpan`] になり、境界箱はページのユーザー空間
+    /// （原点左下・ポイント単位）で返る。改行/空白の復元は行わない
+    /// （文字列としての抽出は [`extract_text`](Self::extract_text) を使う）。
+    pub fn extract_text_spans(&self, index: usize) -> Result<Vec<crate::text::TextSpan>> {
+        let page_id = self.page_id(index)?;
+        crate::text::extract_page_text_spans(self, page_id)
+    }
+
     /// ページをラスタライズして RGBA ピクセルバッファを返す。
     ///
     /// `scale` は 72dpi を 1.0 とする拡大率（2.0 ≒ 144dpi）。ページの
     /// `/MediaBox` と `/Rotate`（継承込み）を反映する。塗り・線・クリップ・
-    /// Form XObject・テキスト（TrueType グリフ）を解釈する。画像は描画しない
-    /// （Phase 3 で対応予定）。テキストは埋め込み TrueType（`/FontFile2`）と
-    /// 非埋め込みのシステムフォント代替（`C:\Windows\Fonts`）に対応し、CFF
-    /// （`.otf`）・Type1 フォントは描画しない（字送りのみ）。
+    /// Form XObject・画像（XObject / インライン）・テキスト（TrueType グリフ）・
+    /// 注釈の外観ストリーム（`/AP` `/N`）を解釈する。テキストは埋め込み
+    /// TrueType（`/FontFile2`）と非埋め込みのシステムフォント代替
+    /// （`C:\Windows\Fonts`）に対応し、CFF（`.otf`）・Type1 フォントは
+    /// 描画しない（字送りのみ）。
     ///
     /// 壊れたコンテントや未対応機能は読み飛ばして「描けるだけ描く」。
     /// コンテントの解析に失敗しても空ページ（背景白）を返し、`Err` にしない。
@@ -603,14 +615,32 @@ impl Document {
         };
         let base_ctm = origin.then(&rot);
 
-        // コンテントを解析して描画。解析失敗時は空ページを返す。
+        // コンテントを解析して描画。解析失敗時も注釈は描く（描けるだけ描く）。
         let resources = self.page_resources(page_id);
+        let mut renderer = Renderer::new(self, &mut pm, base_ctm);
         if let Ok(bytes) = self.page_content_bytes(page_id) {
             if let Ok(ops) = crate::content::parse_content(&bytes) {
-                let mut renderer = Renderer::new(self, &mut pm, base_ctm);
                 renderer.run(&ops, &resources);
             }
         }
+
+        // 注釈の外観ストリーム（/AP /N）をページ内容の上に描画する。
+        let annots: Vec<Dictionary> = match self
+            .get_object(page_id)
+            .ok()
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|d| self.dict_get(d, "Annots"))
+        {
+            Some(Object::Array(a)) => a
+                .iter()
+                .filter_map(|o| self.resolve(o).as_dict().ok().cloned())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for annot in &annots {
+            renderer.draw_annotation(annot, &resources);
+        }
+        drop(renderer);
 
         Ok(pm)
     }

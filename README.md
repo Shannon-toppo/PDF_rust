@@ -28,10 +28,14 @@ doc.save("output.pdf")?;
 ## 主な機能
 
 - **閲覧**: ページ列挙、テキスト抽出（ToUnicode CMap 対応）、メタデータ取得
+- **ビューワー機能**: 位置付きテキスト抽出（`extract_text_spans`）、
+  しおり（`outlines`）、リンク注釈と宛先解決（`page_links`）、
+  ページラベル（`page_label`）
 - **編集**: テキスト・図形の描画、ページ追加/削除/回転、メタデータ編集
 - **日本語描画**: TrueType/TTC フォント埋め込み・自動サブセット化・Identity-H（`add_text_with_font`）
 - **レンダリング**: ページを PNG にラスタライズ（`render_page`）。ベクタ図形・
-  TrueType テキスト・画像（baseline JPEG / FlateDecode 等）・各種色空間に対応
+  TrueType テキスト・画像（baseline JPEG / FlateDecode 等）・各種色空間・
+  注釈の外観ストリーム（/AP）に対応
 - **読み込み対応形式**: 古典 xref / クロスリファレンスストリーム /
   オブジェクトストリーム（PDF 1.5+）/ ハイブリッド / 破損 xref の自動再構築
 - **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,

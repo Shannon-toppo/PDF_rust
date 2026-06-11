@@ -124,6 +124,8 @@ enum PendingClip {
 pub struct Renderer<'a> {
     doc: &'a Document,
     pm: &'a mut Pixmap,
+    /// 基底 CTM（ユーザー空間 → デバイス空間）。注釈外観の描画で使う。
+    base_ctm: Matrix,
     /// グラフィックス状態スタック（先頭が現在状態）。
     stack: Vec<GraphicsState>,
     /// 構築中のパス（ユーザー空間座標）。
@@ -156,6 +158,7 @@ impl<'a> Renderer<'a> {
         Renderer {
             doc,
             pm,
+            base_ctm,
             stack: vec![GraphicsState::new(base_ctm)],
             path: Path::new(),
             current: None,
@@ -760,6 +763,200 @@ impl<'a> Renderer<'a> {
         if self.stack.len() > 1 {
             self.stack.pop();
         }
+    }
+
+    // --- 注釈の外観 ----------------------------------------------------------
+
+    /// 注釈 1 件の外観ストリーム（`/AP` `/N`）を描画する（§12.5.5）。
+    ///
+    /// 外観の `/BBox` を `/Matrix` で変換した境界箱を注釈の `/Rect` へ写す
+    /// 行列を合成し、Form XObject と同様に内容を実行する。Popup 注釈と
+    /// Hidden / NoView フラグ付きは描かない。`page_resources` は外観に
+    /// `/Resources` が無い場合のフォールバック。
+    pub(crate) fn draw_annotation(&mut self, annot: &Dictionary, page_resources: &Dictionary) {
+        if annot.get("Subtype").and_then(|o| o.as_name().ok()) == Some("Popup") {
+            return;
+        }
+        // /F フラグ: bit2 = Hidden(2)、bit6 = NoView(32)。
+        let flags = self
+            .doc
+            .dict_get(annot, "F")
+            .and_then(|o| o.as_int().ok())
+            .unwrap_or(0);
+        if flags & 2 != 0 || flags & 32 != 0 {
+            return;
+        }
+
+        // /Rect を正規化（デバイスではなくユーザー空間）。
+        let rect = match self.annot_rect(annot) {
+            Some(r) => r,
+            None => return,
+        };
+        let (rw, rh) = (rect[2] - rect[0], rect[3] - rect[1]);
+        if rw <= 0.0 || rh <= 0.0 {
+            return; // 大きさのない注釈は描かない。
+        }
+
+        // /AP /N: ストリーム直置きか、状態名（/AS）で引く辞書。
+        let ap = match self.doc.dict_get(annot, "AP") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => return,
+        };
+        let stream = match self.doc.dict_get(&ap, "N") {
+            Some(Object::Stream(s)) => s.clone(),
+            Some(Object::Dictionary(states)) => {
+                let by_as = annot
+                    .get("AS")
+                    .and_then(|o| o.as_name().ok())
+                    .and_then(|n| self.doc.dict_get(states, n));
+                let chosen = match by_as {
+                    Some(Object::Stream(s)) => Some(s.clone()),
+                    // /AS が無い・引けない場合は最初のストリームで代用（耐故障性）。
+                    _ => states.iter().find_map(|(_, v)| match self.doc.resolve(v) {
+                        Object::Stream(s) => Some(s.clone()),
+                        _ => None,
+                    }),
+                };
+                match chosen {
+                    Some(s) => s,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+
+        // /BBox（必須）と /Matrix（既定は単位行列）。
+        let bbox = match self.numbers4(&stream.dict, "BBox") {
+            Some(b) => b,
+            None => return,
+        };
+        let form_matrix = match self.doc.dict_get(&stream.dict, "Matrix") {
+            Some(Object::Array(m)) => {
+                let nums: Vec<f64> = m
+                    .iter()
+                    .filter_map(|o| self.doc.resolve(o).as_number().ok())
+                    .collect();
+                matrix_from_slice(&nums).unwrap_or_else(Matrix::identity)
+            }
+            _ => Matrix::identity(),
+        };
+
+        // BBox の四隅を /Matrix で変換した軸平行境界箱を求める。
+        let (bx0, by0, bx1, by1) = {
+            let corners = [
+                (bbox[0], bbox[1]),
+                (bbox[2], bbox[1]),
+                (bbox[2], bbox[3]),
+                (bbox[0], bbox[3]),
+            ];
+            let mut x0 = f64::INFINITY;
+            let mut y0 = f64::INFINITY;
+            let mut x1 = f64::NEG_INFINITY;
+            let mut y1 = f64::NEG_INFINITY;
+            for (cx, cy) in corners {
+                let p = form_matrix.apply(super::path::Point::new(cx, cy));
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            (x0, y0, x1, y1)
+        };
+        if !(bx0.is_finite() && by0.is_finite() && bx1.is_finite() && by1.is_finite()) {
+            return;
+        }
+
+        // 変換後 BBox → /Rect の写像 A（退化時はスケール 1）。
+        let sx = if bx1 - bx0 > 1e-9 {
+            rw / (bx1 - bx0)
+        } else {
+            1.0
+        };
+        let sy = if by1 - by0 > 1e-9 {
+            rh / (by1 - by0)
+        } else {
+            1.0
+        };
+        let a = Matrix::translate(-bx0, -by0)
+            .then(&Matrix::scale(sx, sy))
+            .then(&Matrix::translate(rect[0], rect[1]));
+
+        // 外観の CTM = /Matrix → A → 基底 CTM。ページ内容の状態とは独立に、
+        // 既定状態から開始する。
+        let saved_len = self.stack.len();
+        let mut gs = GraphicsState::new(self.base_ctm);
+        gs.ctm = form_matrix.then(&a).then(&self.base_ctm);
+        self.stack.push(gs);
+
+        // /BBox でクリップ（フォーム空間 → デバイス空間）。
+        let mut clip_path = Path::new();
+        clip_path.move_to(bbox[0], bbox[1]);
+        clip_path.line_to(bbox[2], bbox[1]);
+        clip_path.line_to(bbox[2], bbox[3]);
+        clip_path.line_to(bbox[0], bbox[3]);
+        clip_path.close();
+        let ctm = self.gs().ctm;
+        let dev = clip_path.transform(&ctm);
+        let mask = Mask::from_path(&dev, FillRule::NonZero, self.pm.width(), self.pm.height());
+        self.gs_mut().clip = Some(mask);
+
+        // 外観自身の /Resources、無ければページのものを使う。
+        let form_res = match self.doc.dict_get(&stream.dict, "Resources") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => page_resources.clone(),
+        };
+
+        if let Ok(data) = self.doc.get_stream_data(&stream) {
+            if let Ok(ops) = parse_content(&data) {
+                let saved_path = std::mem::take(&mut self.path);
+                let saved_cur = self.current.take();
+                let saved_start = self.start.take();
+                let saved_pending = std::mem::replace(&mut self.pending_clip, PendingClip::None);
+
+                self.depth += 1;
+                for op in &ops {
+                    self.exec(op, &form_res);
+                }
+                self.depth -= 1;
+
+                self.path = saved_path;
+                self.current = saved_cur;
+                self.start = saved_start;
+                self.pending_clip = saved_pending;
+            }
+        }
+
+        // 外観実行中の q 過剰にも耐えるよう、スタック長を呼び出し前に戻す。
+        self.stack.truncate(saved_len.max(1));
+    }
+
+    /// 注釈の `/Rect` を正規化して返す。
+    fn annot_rect(&self, annot: &Dictionary) -> Option<[f64; 4]> {
+        let v = self.numbers4(annot, "Rect")?;
+        Some([
+            v[0].min(v[2]),
+            v[1].min(v[3]),
+            v[0].max(v[2]),
+            v[1].max(v[3]),
+        ])
+    }
+
+    /// 辞書から数値 4 つの配列を取り出す（間接参照解決込み。非有限は `None`）。
+    fn numbers4(&self, dict: &Dictionary, key: &str) -> Option<[f64; 4]> {
+        let arr = match self.doc.dict_get(dict, key) {
+            Some(Object::Array(a)) if a.len() == 4 => a,
+            _ => return None,
+        };
+        let mut v = [0.0f64; 4];
+        for (i, o) in arr.iter().enumerate() {
+            v[i] = self
+                .doc
+                .resolve(o)
+                .as_number()
+                .ok()
+                .filter(|x| x.is_finite())?;
+        }
+        Some(v)
     }
 
     // --- 画像 --------------------------------------------------------------

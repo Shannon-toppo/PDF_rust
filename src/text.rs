@@ -68,7 +68,15 @@ struct FontDecoder {
     to_unicode: Option<HashMap<u32, String>>,
     /// 文字幅情報。
     widths: WidthSource,
+    /// アセント（em 単位。FontDescriptor /Ascent ÷ 1000。不明なら近似値）。
+    ascent: f64,
+    /// ディセント（em 単位。負値）。
+    descent: f64,
 }
+
+/// FontDescriptor が引けないときのアセント/ディセント近似値（em 単位）。
+const DEFAULT_ASCENT: f64 = 0.8;
+const DEFAULT_DESCENT: f64 = -0.2;
 
 impl FontDecoder {
     fn fallback() -> FontDecoder {
@@ -76,6 +84,8 @@ impl FontDecoder {
             two_byte: false,
             to_unicode: None,
             widths: WidthSource::Unknown,
+            ascent: DEFAULT_ASCENT,
+            descent: DEFAULT_DESCENT,
         }
     }
 
@@ -92,11 +102,48 @@ impl FontDecoder {
             .and_then(|s| doc.get_stream_data(s).ok())
             .map(|data| parse_tounicode_cmap(&data));
         let widths = Self::load_widths(doc, font, two_byte);
+        let (ascent, descent) = Self::load_vertical_metrics(doc, font, two_byte);
         FontDecoder {
             two_byte,
             to_unicode,
             widths,
+            ascent,
+            descent,
         }
+    }
+
+    /// FontDescriptor の /Ascent /Descent を em 単位（÷1000）で取得する。
+    /// Type0 は /DescendantFonts [0] の記述子を見る。引けない・異常値は近似値。
+    fn load_vertical_metrics(doc: &Document, font: &Dictionary, two_byte: bool) -> (f64, f64) {
+        let owner = if two_byte {
+            doc.dict_get(font, "DescendantFonts")
+                .and_then(|o| o.as_array().ok())
+                .and_then(|a| a.first())
+                .map(|o| doc.resolve(o))
+                .and_then(|o| o.as_dict().ok())
+        } else {
+            Some(font)
+        };
+        let desc = owner
+            .and_then(|d| doc.dict_get(d, "FontDescriptor"))
+            .and_then(|o| o.as_dict().ok());
+        let desc = match desc {
+            Some(d) => d,
+            None => return (DEFAULT_ASCENT, DEFAULT_DESCENT),
+        };
+        let ascent = doc
+            .dict_get(desc, "Ascent")
+            .and_then(|o| o.as_number().ok())
+            .map(|v| v / 1000.0)
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < 4.0)
+            .unwrap_or(DEFAULT_ASCENT);
+        let descent = doc
+            .dict_get(desc, "Descent")
+            .and_then(|o| o.as_number().ok())
+            .map(|v| v / 1000.0)
+            .filter(|v| v.is_finite() && *v < 0.0 && *v > -4.0)
+            .unwrap_or(DEFAULT_DESCENT);
+        (ascent, descent)
     }
 
     pub(crate) fn load_widths(doc: &Document, font: &Dictionary, two_byte: bool) -> WidthSource {
@@ -169,14 +216,19 @@ impl FontDecoder {
         split_codes(bytes, self.two_byte)
     }
 
+    /// コード 1 つを Unicode へ変換して追記する。
+    fn decode_code(&self, code: u32, out: &mut String) {
+        match self.to_unicode.as_ref().and_then(|m| m.get(&code)) {
+            Some(s) => out.push_str(s),
+            None if self.two_byte => out.push('\u{FFFD}'), // マップ不明の CID
+            None => out.push(crate::font::winansi_to_char(code as u8)),
+        }
+    }
+
     /// 表示文字列のバイト列を Unicode 文字列へ変換する。
     fn decode(&self, bytes: &[u8], out: &mut String) {
         for code in self.codes(bytes) {
-            match self.to_unicode.as_ref().and_then(|m| m.get(&code)) {
-                Some(s) => out.push_str(s),
-                None if self.two_byte => out.push('\u{FFFD}'), // マップ不明の CID
-                None => out.push(crate::font::winansi_to_char(code as u8)),
-            }
+            self.decode_code(code, out);
         }
     }
 
@@ -483,6 +535,370 @@ fn show_text(
         (Some(a), Some(units)) => Some(a + units / 1000.0 * font_size),
         _ => None,
     };
+}
+
+// ---------------------------------------------------------------------------
+// 位置付きテキスト抽出（テキストスパン）
+// ---------------------------------------------------------------------------
+
+use crate::render::path::Matrix;
+
+/// 位置付きテキストスパン（テキスト選択・検索ハイライト用）。
+///
+/// 1 つの表示演算（`Tj` `'` `"` または `TJ` 1 回分）が 1 スパンになる。
+/// 座標はページのユーザー空間（原点は左下、y 軸上向き、ポイント単位）で、
+/// `cm` や Form XObject の `/Matrix` は適用済み。ページの `/Rotate` は
+/// 適用しない（描画時の回転はビューワー側の責務）。
+#[derive(Debug, Clone)]
+pub struct TextSpan {
+    /// 抽出テキスト（[`Document::extract_text`] と同じ変換規則）。
+    pub text: String,
+    /// 軸平行境界箱 `[x0, y0, x1, y1]`（x0<x1, y0<y1）。高さはフォントの
+    /// アセント/ディセント（FontDescriptor、無ければ近似値）から推定する。
+    pub bbox: [f64; 4],
+    /// 実効フォントサイズ（テキスト行列・CTM のスケール込み、ポイント）。
+    pub font_size: f64,
+}
+
+/// ページの位置付きテキストスパンを抽出する。
+pub fn extract_page_text_spans(doc: &Document, page_id: ObjectId) -> Result<Vec<TextSpan>> {
+    let content = doc.page_content_bytes(page_id)?;
+    let resources = doc.page_resources(page_id);
+    let mut out = Vec::new();
+    spans_from_content(doc, &content, &resources, Matrix::identity(), &mut out, 0)?;
+    Ok(out)
+}
+
+/// スパン抽出用のグラフィックス/テキスト状態（`q`/`Q` で退避・復元する分）。
+#[derive(Clone)]
+struct SpanState {
+    /// CTM（ユーザー空間 → ページ空間。`cm` と Form の `/Matrix` を合成）。
+    ctm: Matrix,
+    /// 現在フォントのリソース名。
+    font: Option<String>,
+    /// フォントサイズ `Tfs`。
+    font_size: f64,
+    /// 字間 `Tc`。
+    char_spacing: f64,
+    /// 語間 `Tw`（1 バイトコード 32 のみに作用）。
+    word_spacing: f64,
+    /// 水平拡大率 `Tz`（パーセント）。
+    h_scale: f64,
+    /// 行送り `TL`。
+    leading: f64,
+    /// テキストライズ `Ts`。
+    rise: f64,
+}
+
+/// コンテントストリーム 1 本分からスパンを集める。Form XObject は再帰する。
+fn spans_from_content(
+    doc: &Document,
+    content: &[u8],
+    resources: &Dictionary,
+    base_ctm: Matrix,
+    out: &mut Vec<TextSpan>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 8 {
+        return Ok(()); // フォーム再帰の暴走防止
+    }
+    let ops = parse_content(content)?;
+
+    let fonts_dict = doc
+        .dict_get(resources, "Font")
+        .and_then(|o| o.as_dict().ok())
+        .cloned()
+        .unwrap_or_default();
+    let mut decoders: HashMap<String, FontDecoder> = HashMap::new();
+
+    let mut gs = SpanState {
+        ctm: base_ctm,
+        font: None,
+        font_size: 0.0,
+        char_spacing: 0.0,
+        word_spacing: 0.0,
+        h_scale: 100.0,
+        leading: 0.0,
+        rise: 0.0,
+    };
+    let mut stack: Vec<SpanState> = Vec::new();
+    let mut tm = Matrix::identity();
+    let mut tlm = Matrix::identity();
+
+    let num = |args: &[Object], i: usize| -> Option<f64> {
+        args.get(i)
+            .and_then(|o| o.as_number().ok())
+            .filter(|v| v.is_finite())
+    };
+
+    for op in &ops {
+        let args = &op.operands;
+        match op.operator.as_str() {
+            "q" => stack.push(gs.clone()),
+            "Q" => {
+                if let Some(s) = stack.pop() {
+                    gs = s;
+                }
+            }
+            "cm" => {
+                if let Some(m) = operand_matrix(args) {
+                    gs.ctm = m.then(&gs.ctm);
+                }
+            }
+            "BT" => {
+                tm = Matrix::identity();
+                tlm = Matrix::identity();
+            }
+            "Tf" => {
+                if let Some(Object::Name(n)) = args.first() {
+                    if !decoders.contains_key(n) {
+                        let decoder = doc
+                            .dict_get(&fonts_dict, n)
+                            .and_then(|o| o.as_dict().ok())
+                            .map(|fd| FontDecoder::from_font_dict(doc, fd))
+                            .unwrap_or_else(FontDecoder::fallback);
+                        decoders.insert(n.clone(), decoder);
+                    }
+                    gs.font = Some(n.clone());
+                }
+                if let Some(s) = num(args, 1) {
+                    gs.font_size = s;
+                }
+            }
+            "Tc" => {
+                if let Some(v) = num(args, 0) {
+                    gs.char_spacing = v;
+                }
+            }
+            "Tw" => {
+                if let Some(v) = num(args, 0) {
+                    gs.word_spacing = v;
+                }
+            }
+            "Tz" => {
+                if let Some(v) = num(args, 0) {
+                    gs.h_scale = v;
+                }
+            }
+            "TL" => {
+                if let Some(v) = num(args, 0) {
+                    gs.leading = v;
+                }
+            }
+            "Ts" => {
+                if let Some(v) = num(args, 0) {
+                    gs.rise = v;
+                }
+            }
+            "Td" | "TD" => {
+                let tx = num(args, 0).unwrap_or(0.0);
+                let ty = num(args, 1).unwrap_or(0.0);
+                if op.operator == "TD" {
+                    gs.leading = -ty;
+                }
+                tlm = Matrix::translate(tx, ty).then(&tlm);
+                tm = tlm;
+            }
+            "Tm" => {
+                if let Some(m) = operand_matrix(args) {
+                    tlm = m;
+                    tm = m;
+                }
+            }
+            "T*" => {
+                tlm = Matrix::translate(0.0, -gs.leading).then(&tlm);
+                tm = tlm;
+            }
+            "Tj" | "'" | "\"" => {
+                if op.operator != "Tj" {
+                    // ' と " は次行へ移ってから表示。" は語間・字間も設定する。
+                    if op.operator == "\"" {
+                        if let Some(aw) = num(args, 0) {
+                            gs.word_spacing = aw;
+                        }
+                        if let Some(ac) = num(args, 1) {
+                            gs.char_spacing = ac;
+                        }
+                    }
+                    tlm = Matrix::translate(0.0, -gs.leading).then(&tlm);
+                    tm = tlm;
+                }
+                let bytes = args.iter().rev().find_map(|o| o.as_string().ok());
+                if let Some(bytes) = bytes {
+                    let decoder = span_decoder(&decoders, &gs.font);
+                    let mut text = String::new();
+                    let mut tx = 0.0;
+                    span_string_metrics(decoder, bytes, &gs, &mut text, &mut tx);
+                    push_span(out, decoder, &gs, &tm, tx, text);
+                    tm = Matrix::translate(tx, 0.0).then(&tm);
+                }
+            }
+            "TJ" => {
+                let items = match args.first() {
+                    Some(Object::Array(a)) => a,
+                    _ => continue,
+                };
+                let decoder = span_decoder(&decoders, &gs.font);
+                let mut text = String::new();
+                let mut tx = 0.0;
+                for item in items {
+                    match item {
+                        Object::String(bytes, _) => {
+                            span_string_metrics(decoder, bytes, &gs, &mut text, &mut tx);
+                        }
+                        Object::Integer(_) | Object::Real(_) => {
+                            let adj = item.as_number().unwrap_or(0.0);
+                            tx += -adj / 1000.0 * gs.font_size * gs.h_scale / 100.0;
+                        }
+                        _ => {}
+                    }
+                }
+                push_span(out, decoder, &gs, &tm, tx, text);
+                tm = Matrix::translate(tx, 0.0).then(&tm);
+            }
+            "Do" => {
+                if let Some(Object::Name(n)) = args.first() {
+                    let xobj = doc
+                        .dict_get(resources, "XObject")
+                        .and_then(|o| o.as_dict().ok())
+                        .and_then(|x| doc.dict_get(x, n))
+                        .and_then(|o| o.as_stream().ok().cloned());
+                    if let Some(stream) = xobj {
+                        let is_form = stream.dict.get("Subtype").and_then(|o| o.as_name().ok())
+                            == Some("Form");
+                        if is_form {
+                            if let Ok(data) = doc.get_stream_data(&stream) {
+                                let sub_res = match doc.dict_get(&stream.dict, "Resources") {
+                                    Some(Object::Dictionary(d)) => d.clone(),
+                                    _ => resources.clone(),
+                                };
+                                // Form の /Matrix を CTM に合成して再帰。
+                                let mut ctm = gs.ctm;
+                                if let Some(Object::Array(m)) = doc.dict_get(&stream.dict, "Matrix")
+                                {
+                                    let nums: Vec<f64> = m
+                                        .iter()
+                                        .filter_map(|o| doc.resolve(o).as_number().ok())
+                                        .collect();
+                                    if let Some(fm) = matrix_from_nums(&nums) {
+                                        ctm = fm.then(&ctm);
+                                    }
+                                }
+                                spans_from_content(doc, &data, &sub_res, ctm, out, depth + 1)?;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// 現在フォントのデコーダを引く（未設定・解決失敗はフォールバック）。
+fn span_decoder<'a>(
+    decoders: &'a HashMap<String, FontDecoder>,
+    current: &Option<String>,
+) -> &'a FontDecoder {
+    static FALLBACK: std::sync::OnceLock<FontDecoder> = std::sync::OnceLock::new();
+    let fallback = FALLBACK.get_or_init(FontDecoder::fallback);
+    current
+        .as_ref()
+        .and_then(|n| decoders.get(n))
+        .unwrap_or(fallback)
+}
+
+/// 表示文字列 1 つ分のテキストと advance（テキスト空間）を累積する。
+///
+/// 幅不明のコードは 500/1000 em とみなす（bbox を返せることを優先）。
+fn span_string_metrics(
+    decoder: &FontDecoder,
+    bytes: &[u8],
+    gs: &SpanState,
+    text: &mut String,
+    tx: &mut f64,
+) {
+    for code in decoder.codes(bytes) {
+        decoder.decode_code(code, text);
+        let w0 = decoder.code_width(code).unwrap_or(500.0);
+        let mut adv = w0 / 1000.0 * gs.font_size + gs.char_spacing;
+        if !decoder.two_byte && code == 32 {
+            adv += gs.word_spacing;
+        }
+        *tx += adv * gs.h_scale / 100.0;
+    }
+}
+
+/// スパン 1 つを構築して `out` へ追加する（テキストが空なら何もしない）。
+///
+/// `tm` はスパン開始時点のテキスト行列、`tx` は表示全体の advance
+/// （テキスト空間。`TJ` の字送り調整込み）。
+fn push_span(
+    out: &mut Vec<TextSpan>,
+    decoder: &FontDecoder,
+    gs: &SpanState,
+    tm: &Matrix,
+    tx: f64,
+    text: String,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let trm = tm.then(&gs.ctm); // テキスト空間 → ページ空間
+    let y0 = decoder.descent * gs.font_size + gs.rise;
+    let y1 = decoder.ascent * gs.font_size + gs.rise;
+    let (x0, x1) = (0.0_f64.min(tx), 0.0_f64.max(tx));
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+    let mut bx0 = f64::INFINITY;
+    let mut by0 = f64::INFINITY;
+    let mut bx1 = f64::NEG_INFINITY;
+    let mut by1 = f64::NEG_INFINITY;
+    for (cx, cy) in corners {
+        let p = trm.apply(crate::render::path::Point::new(cx, cy));
+        bx0 = bx0.min(p.x);
+        by0 = by0.min(p.y);
+        bx1 = bx1.max(p.x);
+        by1 = by1.max(p.y);
+    }
+    if !(bx0.is_finite() && by0.is_finite() && bx1.is_finite() && by1.is_finite()) {
+        return; // 行列が壊れている（非有限）スパンは捨てる
+    }
+    // 実効フォントサイズ: テキスト空間の単位縦ベクトル (0,1) の像の長さ。
+    let v = (trm.c * trm.c + trm.d * trm.d).sqrt();
+    let font_size = if v.is_finite() && v > 0.0 {
+        gs.font_size * v
+    } else {
+        gs.font_size
+    };
+    out.push(TextSpan {
+        text,
+        bbox: [bx0, by0, bx1, by1],
+        font_size,
+    });
+}
+
+/// `cm`/`Tm` のオペランド 6 要素から行列を作る（不足・非有限は `None`）。
+fn operand_matrix(args: &[Object]) -> Option<Matrix> {
+    let v: Vec<f64> = (0..6)
+        .filter_map(|i| args.get(i).and_then(|o| o.as_number().ok()))
+        .collect();
+    matrix_from_nums(&v)
+}
+
+/// 6 要素のスライスから行列を作る。
+fn matrix_from_nums(v: &[f64]) -> Option<Matrix> {
+    if v.len() != 6 || !v.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    Some(Matrix {
+        a: v[0],
+        b: v[1],
+        c: v[2],
+        d: v[3],
+        e: v[4],
+        f: v[5],
+    })
 }
 
 // ---------------------------------------------------------------------------

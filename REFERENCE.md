@@ -98,7 +98,21 @@ doc.save("edited.pdf")?;     // 完全書き直しで保存
 | `doc.page_content_bytes(id)` | 全コンテントストリームを伸長して連結 |
 | `doc.page_resources(id)` | 実効 `/Resources` 辞書 |
 | `doc.extract_text(index)` | テキスト抽出 |
-| `doc.render_page(index, scale)` | ページを `Pixmap`（RGBA）にラスタライズ。`pixmap.save_png(path)` / `pixmap.to_png()` で PNG 化 |
+| `doc.extract_text_spans(index)` | 位置付きテキスト抽出。`Vec<TextSpan { text, bbox, font_size }>`（テキスト選択・検索ハイライト用。bbox はユーザー空間） |
+| `doc.render_page(index, scale)` | ページを `Pixmap`（RGBA）にラスタライズ（注釈の外観 `/AP` 込み）。`pixmap.save_png(path)` / `pixmap.to_png()` で PNG 化 |
+
+#### ビューワー機能（しおり・リンク・ページラベル）
+
+| メソッド | 説明 |
+|---|---|
+| `doc.outlines()` | しおり（`/Outlines` ツリー）を `Vec<OutlineItem { title, target, children }>` で返す |
+| `doc.page_links(index)` | ページのリンク注釈を `Vec<Link { rect, target }>` で返す（GoTo / URI） |
+| `doc.page_label(index)` | ページラベル（`/PageLabels`。D/R/r/A/a スタイル + 接頭辞）。無ければ `"1"` 始まりの 10 進 |
+| `doc.page_labels()` | 全ページのラベルを一括取得 |
+
+移動先は [`LinkTarget`]（`Goto(Destination)` / `Uri(String)`）で表現され、
+`Destination` はページ番号（0 始まり）と `/XYZ` 等の表示座標を持つ。
+名前付き宛先（古典 `/Dests` 辞書・`/Names /Dests` 名前ツリー）も解決される。
 
 #### ページ編集
 
@@ -369,7 +383,8 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `object` | `Object` / `Dictionary`（挿入順保持）/ `Stream` |
 | `document` | 中心 API。オブジェクト管理、ページツリー操作、編集、メタデータ |
 | `content` | コンテントストリーム ⇔ `Operation` 列の相互変換。インライン画像は辞書 + 生データとして保持 |
-| `text` | テキスト抽出。ToUnicode CMap（bfchar/bfrange）、Form XObject 再帰、改行/空白ヒューリスティック |
+| `text` | テキスト抽出。ToUnicode CMap（bfchar/bfrange）、Form XObject 再帰、改行/空白ヒューリスティック、位置付きスパン抽出（`TextSpan`） |
+| `interactive` | ビューワー機能。しおり（/Outlines）、リンク注釈、宛先解決（明示配列・名前付き）、ページラベル（/PageLabels 数値ツリー） |
 | `font` | 標準 14 フォントの幅テーブル（AFM 由来）、WinAnsi ⇔ Unicode |
 | `truetype` | TTF/TTC パーサ。cmap format 4/12、hmtx/head/hhea/maxp/OS∕ 2/post/name/loca/glyf |
 | `subset` | TrueType サブセッタ。グリフ閉包（composite 対応）、sparse glyf、チェックサム再計算 |
@@ -377,7 +392,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `filters::dct` | baseline JPEG（DCTDecode）デコーダ。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
 | `function` | PDF 関数（§7.10）インタプリタ。Type 0（サンプル）/ 2（指数）/ 3（継ぎ接ぎ）/ 4（PostScript 電卓） |
 | `encoding` | 単純フォントのエンコーディング解決（Standard/MacRoman/`/Differences`/グリフ名） |
-| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ）/ `state`（演算解釈）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画） |
+| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ）/ `state`（演算解釈 + 注釈外観 `/AP` の描画）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画） |
 
 ### 4.2 設計上の選択
 
@@ -403,7 +418,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 ### 4.3 テスト
 
 ```
-cargo test          # ユニット 189 + 統合 41 + doctest 2
+cargo test          # ユニット 198 + 統合 47 + doctest 2
 ```
 
 - フィルタは既知ベクタ（.NET `ZLibStream` で生成した zlib データ、
@@ -438,6 +453,10 @@ cargo test          # ユニット 189 + 統合 41 + doctest 2
 - ✅ 色空間: DeviceGray/RGB/CMYK、Indexed、ICCBased（/N・/Alternate 近似）、
   Separation/DeviceN（tint 変換 = PDF 関数 Type 0/2/3/4 インタプリタ）、
   CalGray/CalRGB（Device 同一視）、Lab（近似変換）
+- ✅ ビューワー機能: 位置付きテキスト抽出（`extract_text_spans`）、しおり
+  （`outlines`）、リンク注釈と宛先解決（`page_links`。明示配列・名前付き宛先）、
+  ページラベル（`page_label`）、注釈の外観描画（`/AP` `/N`。`/AS` 状態選択、
+  Hidden/NoView フラグ対応）
 
 ### 制限
 
@@ -452,5 +471,6 @@ cargo test          # ユニット 189 + 統合 41 + doctest 2
 - ❌ 増分更新での保存（電子署名は保存すると無効になる）
 - ❌ レイアウト解析 — テキスト抽出は読み上げ順のヒューリスティック
 - ❌ ToUnicode の無い CID フォント、`/Differences` エンコーディングは近似
-- ❌ タグ付き PDF、注釈、フォーム（AcroForm）の高レベル API
-  （`doc.objects` への低レベルアクセスでは操作可能）
+- ❌ タグ付き PDF、フォーム（AcroForm）の高レベル API、注釈の作成・編集 API
+  （読み取り = `page_links` / 外観描画は対応。`doc.objects` への
+  低レベルアクセスでは操作可能）

@@ -108,15 +108,30 @@ colorspace 21 + state 2 + image 14 + render 統合 8。
 既知の制限: /Mask（ステンシル・カラーキー）、progressive JPEG、JPX/CCITT/JBIG2、
 画像境界の AA は未対応（読み飛ばし）。
 
-## Phase 4: ビューワー機能（描画以外）— 規模: 中
+## Phase 4: ビューワー機能（描画以外）— 規模: 中 ✅ 完了（2026-06-11）
 
 Phase 1–3 と独立。並行作業可能。
 
-- [ ] 位置付きテキスト抽出: `extract_text_spans(index) -> Vec<TextSpan { text, bbox, font_size }>`
-- [ ] しおり（/Outlines ツリー）読み取り API
-- [ ] リンク注釈と移動先（`/Annots` → GoTo/URI、Destination/名前付き宛先の解決）
-- [ ] ページラベル（/PageLabels）
-- [ ] 注釈の外観描画（`/AP` アピアランスストリーム → Form XObject としてレンダラへ）
+- [x] 位置付きテキスト抽出: `extract_text_spans(index) -> Vec<TextSpan { text, bbox, font_size }>`
+      （`text.rs` に独立した状態機械を追加。抽出側の改行/空白ヒューリスティックとは
+      分離し、1 表示演算 = 1 スパン。bbox は FontDescriptor の Ascent/Descent
+      （無ければ 0.8/-0.2 em 近似）から推定。cm・Form /Matrix の CTM 合成済み）
+- [x] しおり（/Outlines ツリー）読み取り API: `doc.outlines() -> Vec<OutlineItem>`
+- [x] リンク注釈と移動先: `doc.page_links(index) -> Vec<Link>`（GoTo/URI、明示宛先
+      配列 + 古典 /Dests 辞書 + /Names /Dests 名前ツリーの解決。新モジュール
+      `interactive.rs`）
+- [x] ページラベル（/PageLabels）: `doc.page_label(index)`（D/R/r/A/a・/P・/St、
+      数値ツリーの /Kids 再帰対応）
+- [x] 注釈の外観描画（`/AP` `/N` の BBox×Matrix → /Rect 写像で Form XObject 同様に
+      実行。/AS 状態辞書・Hidden/NoView フラグ・Popup 除外に対応）
+
+検証済み: `interactive.rs` ユニット 8 + 統合 6（スパン往復・CTM 反映・しおり/リンク/
+ラベル往復・外観描画のピクセル検証・Hidden 非描画・/AS 選択）。しおり自己参照・
+名前ツリー循環で無限ループしないことをテストで確認（2026-06-11）。
+
+実績: 委譲なしで直接実装（1 セッション、全 5 項目 + ドキュメント同期）。
+既知の制限: 外観は /N のみ（/D・/R は無視）、GoToR・Launch・JavaScript アクションは
+未対応（無視）、スパンの bbox はグリフ実測ではなくメトリクス推定。
 
 **委譲**: しおり・リンク・ページラベルは **Sonnet 可**（辞書の走査が主体）。
 位置付き抽出は **Opus 推奨**（`text.rs` の改行/空白ヒューリスティックとの整合が必要）。

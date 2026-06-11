@@ -47,7 +47,8 @@
 //! | [`filters`] | ストリームフィルタ（Flate, LZW, ASCII85, RunLength…） |
 //! | [`content`] | コンテントストリームの解析・生成 |
 //! | [`function`] | PDF 関数インタプリタ（Type 0/2/3/4） |
-//! | [`text`] | テキスト抽出（ToUnicode CMap 対応） |
+//! | [`text`] | テキスト抽出（ToUnicode CMap 対応・位置付きスパン） |
+//! | [`interactive`] | しおり・リンク注釈・宛先解決・ページラベル |
 //! | [`font`] | 標準 14 フォントのメトリクスと WinAnsi 変換 |
 //! | [`encoding`] | 単純フォントのエンコーディング解決（Standard/MacRoman/グリフ名） |
 //! | [`truetype`] / [`subset`] | TrueType パーサ（glyf アウトライン込み）とサブセッタ |
@@ -62,11 +63,11 @@
 //!   ToUnicode を持たない CID フォントや `/Differences` は近似になる
 //! - 画像コーデックのうち JPEG（DCTDecode baseline）はデコード対応。
 //!   JPX/CCITTFax/JBIG2 と progressive JPEG は未対応（生データの取得は可能）
-//! - レンダリングは画像 XObject・インライン画像を描画する（BitsPerComponent
-//!   1/2/4/8/16、/Decode、ImageMask、SMask、各種色空間、baseline JPEG）。
-//!   /Mask（ステンシル・カラーキー）・シェーディング・透明度（ブレンドモード・
-//!   透明グループ）は未対応。CFF/Type1 のテキストはシステムフォント代替で
-//!   近似描画する
+//! - レンダリングは画像 XObject・インライン画像（BitsPerComponent 1/2/4/8/16、
+//!   /Decode、ImageMask、SMask、各種色空間、baseline JPEG）と注釈の外観
+//!   ストリーム（/AP /N）を描画する。/Mask（ステンシル・カラーキー）・
+//!   シェーディング・透明度（ブレンドモード・透明グループ）は未対応。
+//!   CFF/Type1 のテキストはシステムフォント代替で近似描画する
 
 pub mod content;
 pub mod document;
@@ -75,6 +76,7 @@ pub mod error;
 pub mod filters;
 pub mod font;
 pub mod function;
+pub mod interactive;
 pub mod lexer;
 pub mod object;
 pub mod parser;
@@ -91,6 +93,8 @@ pub use document::{
 };
 pub use error::{PdfError, Result};
 pub use font::StandardFont;
+pub use interactive::{Destination, Link, LinkTarget, OutlineItem};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
 pub use render::Pixmap;
+pub use text::TextSpan;
 pub use truetype::TrueTypeFont;
