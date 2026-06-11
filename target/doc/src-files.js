@@ -1,2 +1,0 @@
-createSrcSidebar('[["pdf_rust",["",[["filters",[],["flate.rs","mod.rs"]]],["content.rs","document.rs","error.rs","font.rs","lexer.rs","lib.rs","object.rs","parser.rs","text.rs","writer.rs","xref.rs"]]]]');
-//{"start":19,"fragment_lengths":[182]}

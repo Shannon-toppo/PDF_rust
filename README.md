@@ -30,10 +30,12 @@ doc.save("output.pdf")?;
 - **閲覧**: ページ列挙、テキスト抽出（ToUnicode CMap 対応）、メタデータ取得
 - **編集**: テキスト・図形の描画、ページ追加/削除/回転、メタデータ編集
 - **日本語描画**: TrueType/TTC フォント埋め込み・自動サブセット化・Identity-H（`add_text_with_font`）
+- **レンダリング**: ページを PNG にラスタライズ（`render_page`）。ベクタ図形・
+  TrueType テキスト・画像（baseline JPEG / FlateDecode 等）・各種色空間に対応
 - **読み込み対応形式**: 古典 xref / クロスリファレンスストリーム /
   オブジェクトストリーム（PDF 1.5+）/ ハイブリッド / 破損 xref の自動再構築
 - **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,
-  ASCIIHex, RunLength — すべて自前実装
+  ASCIIHex, RunLength, baseline JPEG（DCTDecode）— すべて自前実装
 
 ## 使い方
 
@@ -43,6 +45,7 @@ cargo run --example create_pdf                    # PDF を生成 → hello.pdf
 cargo run --example japanese_pdf                  # 日本語 PDF を生成 → japanese.pdf
 cargo run --example inspect -- hello.pdf          # 中身を表示
 cargo run --example edit_pdf -- hello.pdf out.pdf # 編集して別名保存
+cargo run --example render_page -- in.pdf out.png # ページを PNG に描画
 cargo doc --open                                  # API ドキュメント
 ```
 
@@ -59,5 +62,7 @@ cargo doc --open                                  # API ドキュメント
   （`add_text_with_font` で日本語を含む Unicode 文字を描画可能）
 - CFF アウトライン（`.otf`）は未対応。`load_font_from_bytes` がエラーを返す
 - 縦書き（Identity-V）は未対応
+- レンダリングは progressive JPEG / JPX / CCITT / JBIG2 の画像、
+  シェーディング、透明グループが未対応（読み飛ばして描画継続）
 
 詳細は [REFERENCE.md の §5](REFERENCE.md#5-対応機能と制限事項) を参照。

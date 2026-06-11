@@ -264,6 +264,23 @@ impl Document {
         id
     }
 
+    /// メモリ上の埋め込みフォント（[`load_font`](Self::load_font) で読み込んだもの）の
+    /// パース済み TrueType プログラムを、その Type0 オブジェクト ID から引く。
+    ///
+    /// `to_bytes`/`save` 前は `/FontFile2` がまだ生成されていない（プレースホルダ
+    /// が Null）ため、レンダラはこの経路でメモリ上のフォントを直接使ってグリフを
+    /// 描画する。保存後に再読み込みした文書では `embedded_fonts` が空になるので
+    /// `None` を返し、レンダラは `/FontFile2` から復元する。
+    pub(crate) fn embedded_program_by_type0_id(
+        &self,
+        id: ObjectId,
+    ) -> Option<&crate::truetype::TrueTypeFont> {
+        self.embedded_fonts
+            .iter()
+            .find(|ef| ef.type0_id == id)
+            .map(|ef| &ef.font)
+    }
+
     /// ID でオブジェクトを取得する。世代番号が一致しない場合は
     /// 同じ番号の別世代も探す（壊れた PDF への耐性）。
     pub fn get_object(&self, id: ObjectId) -> Result<&Object> {
@@ -456,6 +473,146 @@ impl Document {
     pub fn extract_text(&self, index: usize) -> Result<String> {
         let page_id = self.page_id(index)?;
         crate::text::extract_page_text(self, page_id)
+    }
+
+    /// ページをラスタライズして RGBA ピクセルバッファを返す。
+    ///
+    /// `scale` は 72dpi を 1.0 とする拡大率（2.0 ≒ 144dpi）。ページの
+    /// `/MediaBox` と `/Rotate`（継承込み）を反映する。塗り・線・クリップ・
+    /// Form XObject・テキスト（TrueType グリフ）を解釈する。画像は描画しない
+    /// （Phase 3 で対応予定）。テキストは埋め込み TrueType（`/FontFile2`）と
+    /// 非埋め込みのシステムフォント代替（`C:\Windows\Fonts`）に対応し、CFF
+    /// （`.otf`）・Type1 フォントは描画しない（字送りのみ）。
+    ///
+    /// 壊れたコンテントや未対応機能は読み飛ばして「描けるだけ描く」。
+    /// コンテントの解析に失敗しても空ページ（背景白）を返し、`Err` にしない。
+    pub fn render_page(&self, index: usize, scale: f64) -> Result<crate::render::Pixmap> {
+        use crate::render::{Matrix, Pixmap, Renderer};
+
+        let page_id = self.page_id(index)?;
+
+        // MediaBox を取得して x0<x1・y0<y1 に正規化。
+        let mb = self.page_media_box(page_id);
+        let x0 = mb[0].min(mb[2]);
+        let y0 = mb[1].min(mb[3]);
+        let x1 = mb[0].max(mb[2]);
+        let y1 = mb[1].max(mb[3]);
+        let page_w = (x1 - x0).max(1.0);
+        let page_h = (y1 - y0).max(1.0);
+
+        // Rotate を 0/90/180/270 へ正規化（負値・360 超も対応）。
+        let rotate = self
+            .page_attr(page_id, "Rotate")
+            .and_then(|o| o.as_int().ok())
+            .unwrap_or(0)
+            .rem_euclid(360);
+        let rotate = (rotate / 90 * 90).rem_euclid(360); // 90 の倍数でない値は切り捨て
+
+        // スケールの補正。
+        let mut scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+
+        // デバイスサイズ（回転で幅高さ交換）。
+        let (dev_w_f, dev_h_f) = if rotate == 90 || rotate == 270 {
+            (page_h * scale, page_w * scale)
+        } else {
+            (page_w * scale, page_h * scale)
+        };
+
+        // ピクセル数の上限ガード（長辺 10000・総面積 1 億）。
+        const MAX_SIDE: f64 = 10000.0;
+        const MAX_AREA: f64 = 100_000_000.0;
+        let longest = dev_w_f.max(dev_h_f);
+        if longest > MAX_SIDE {
+            scale *= MAX_SIDE / longest;
+        }
+        let area = (page_w * scale) * (page_h * scale);
+        if area > MAX_AREA {
+            scale *= (MAX_AREA / area).sqrt();
+        }
+
+        // 最終デバイスサイズ。
+        let (dev_w, dev_h) = if rotate == 90 || rotate == 270 {
+            (
+                (page_h * scale).ceil().max(1.0) as u32,
+                (page_w * scale).ceil().max(1.0) as u32,
+            )
+        } else {
+            (
+                (page_w * scale).ceil().max(1.0) as u32,
+                (page_h * scale).ceil().max(1.0) as u32,
+            )
+        };
+
+        let mut pm = Pixmap::new(dev_w, dev_h);
+
+        // 基底 CTM の構成。
+        //
+        // 手順（点 p に作用する順）:
+        //   1. MediaBox 原点を引いて左下を原点へ: translate(-x0, -y0)
+        //   2. scale 倍
+        //   3. y 軸反転 + 回転（左下原点 y 上向き → 左上原点 y 下向き）
+        //
+        // 回転は「ページを時計回りに表示」する一般的なビューワー挙動に合わせ、
+        // 各回転で結果が dev_w × dev_h の第 1 象限に収まるよう平行移動を足す。
+        let sw = page_w * scale; // 回転前スケール後の幅
+        let sh = page_h * scale; // 回転前スケール後の高さ
+        let origin = Matrix::translate(-x0, -y0).then(&Matrix::scale(scale, scale));
+        let rot = match rotate {
+            90 => {
+                // (sx, sy) → (sh? ...) 時計回り 90。
+                // x' = sh - sy 相当を行列で: a=0 b=1 c=-1 d=0 ... ではなく
+                // 下記で第1象限へ収める。
+                Matrix {
+                    a: 0.0,
+                    b: 1.0,
+                    c: 1.0,
+                    d: 0.0,
+                    e: 0.0,
+                    f: 0.0,
+                }
+            }
+            180 => Matrix {
+                a: -1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: sw,
+                f: 0.0,
+            },
+            270 => Matrix {
+                a: 0.0,
+                b: -1.0,
+                c: -1.0,
+                d: 0.0,
+                e: sh,
+                f: sw,
+            },
+            _ => Matrix {
+                // 回転 0: y 反転のみ（x はそのまま、y は高さから引く）。
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: -1.0,
+                e: 0.0,
+                f: sh,
+            },
+        };
+        let base_ctm = origin.then(&rot);
+
+        // コンテントを解析して描画。解析失敗時は空ページを返す。
+        let resources = self.page_resources(page_id);
+        if let Ok(bytes) = self.page_content_bytes(page_id) {
+            if let Ok(ops) = crate::content::parse_content(&bytes) {
+                let mut renderer = Renderer::new(self, &mut pm, base_ctm);
+                renderer.run(&ops, &resources);
+            }
+        }
+
+        Ok(pm)
     }
 }
 

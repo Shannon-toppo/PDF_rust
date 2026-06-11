@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["format_real","write_document","write_object"]};

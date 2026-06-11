@@ -98,6 +98,7 @@ doc.save("edited.pdf")?;     // 完全書き直しで保存
 | `doc.page_content_bytes(id)` | 全コンテントストリームを伸長して連結 |
 | `doc.page_resources(id)` | 実効 `/Resources` 辞書 |
 | `doc.extract_text(index)` | テキスト抽出 |
+| `doc.render_page(index, scale)` | ページを `Pixmap`（RGBA）にラスタライズ。`pixmap.save_png(path)` / `pixmap.to_png()` で PNG 化 |
 
 #### ページ編集
 
@@ -354,6 +355,8 @@ PDF は追記による更新（incremental update）が可能で、その場合 
   Document ──writer──▶ ヘッダ + 全オブジェクト + xref テーブル + トレーラ
 テキスト抽出:
   page /Contents ──filters(伸長)──▶ content(演算列) ──text(状態機械)──▶ String
+レンダリング:
+  page /Contents ──content(演算列)──▶ render::state(解釈) ──path/raster──▶ Pixmap ──▶ PNG
 ```
 
 | モジュール | 内容 |
@@ -365,12 +368,16 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `filters::flate` | RFC 1950/1951 実装。inflate は固定・動的ハフマン両対応。deflate は stored ブロック |
 | `object` | `Object` / `Dictionary`（挿入順保持）/ `Stream` |
 | `document` | 中心 API。オブジェクト管理、ページツリー操作、編集、メタデータ |
-| `content` | コンテントストリーム ⇔ `Operation` 列の相互変換。インライン画像スキップ |
+| `content` | コンテントストリーム ⇔ `Operation` 列の相互変換。インライン画像は辞書 + 生データとして保持 |
 | `text` | テキスト抽出。ToUnicode CMap（bfchar/bfrange）、Form XObject 再帰、改行/空白ヒューリスティック |
 | `font` | 標準 14 フォントの幅テーブル（AFM 由来）、WinAnsi ⇔ Unicode |
 | `truetype` | TTF/TTC パーサ。cmap format 4/12、hmtx/head/hhea/maxp/OS∕ 2/post/name/loca/glyf |
 | `subset` | TrueType サブセッタ。グリフ閉包（composite 対応）、sparse glyf、チェックサム再計算 |
 | `writer` | シリアライザ。実数の正規化、文字列/名前のエスケープ、xref 生成、`/ID` 生成（FNV-1a） |
+| `filters::dct` | baseline JPEG（DCTDecode）デコーダ。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
+| `function` | PDF 関数（§7.10）インタプリタ。Type 0（サンプル）/ 2（指数）/ 3（継ぎ接ぎ）/ 4（PostScript 電卓） |
+| `encoding` | 単純フォントのエンコーディング解決（Standard/MacRoman/`/Differences`/グリフ名） |
+| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ）/ `state`（演算解釈）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画） |
 
 ### 4.2 設計上の選択
 
@@ -396,11 +403,15 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 ### 4.3 テスト
 
 ```
-cargo test          # ユニット 50 + 統合 11 + doctest 2
+cargo test          # ユニット 189 + 統合 41 + doctest 2
 ```
 
 - フィルタは既知ベクタ（.NET `ZLibStream` で生成した zlib データ、
   Adler-32 既知値、ASCII85 の手計算ベクタ）で検証
+- JPEG デコーダは .NET `System.Drawing` で外部生成したフィクスチャ
+  （`tests/fixtures/*.jpg` と参照デコード結果 `*.rgb`）との誤差比較で検証
+- レンダリングは「コンテント生成 → `render_page` → ピクセル検証」の統合テスト +
+  WinRT `Windows.Data.Pdf` 出力との目視比較（`winrt_render.ps1`）で検証
 - 統合テストは「生成 → 保存 → 再読込 → 抽出」の往復、
   xref ストリーム + ObjStm を使う PDF 1.5 形式ファイルの手組みバイト列、
   startxref 破壊からの復元、暗号化 PDF の拒否を含む
@@ -418,13 +429,26 @@ cargo test          # ユニット 50 + 統合 11 + doctest 2
 - ✅ 生成: ゼロからの文書作成、標準 14 フォント、文書情報、`/ID` 生成
 - ✅ 日本語描画: TrueType（glyf）/TTC フォントの埋め込みによる Unicode テキスト描画 + 自動サブセット化
 - ✅ 日本語: 抽出・メタデータは UTF-16BE で完全対応
+- ✅ レンダリング: `render_page` でページを RGBA ラスタライズ（PNG 書き出し）。
+  パス（塗り/ストローク/ダッシュ/クリップ、アンチエイリアス）、テキスト
+  （埋め込み TrueType + システムフォント代替）、Form XObject 再帰
+- ✅ 画像描画: 画像 XObject とインライン画像（BI）。BitsPerComponent 1/2/4/8/16、
+  `/Decode`、ImageMask（ステンシル）、SMask（アルファ）、baseline JPEG（DCTDecode）、
+  ExtGState `/ca`、回転・せん断 CTM（双線形/最近傍サンプリング）
+- ✅ 色空間: DeviceGray/RGB/CMYK、Indexed、ICCBased（/N・/Alternate 近似）、
+  Separation/DeviceN（tint 変換 = PDF 関数 Type 0/2/3/4 インタプリタ）、
+  CalGray/CalRGB（Device 同一視）、Lab（近似変換）
 
 ### 制限
 
 - ❌ 暗号化 PDF（RC4/AES）— 読み込み時に `EncryptionNotSupported`
 - ❌ CFF アウトライン（`.otf`）— `load_font_from_bytes` が `PdfError::Font` を返す
 - ❌ 縦書き（Identity-V）— 横書き（Identity-H）のみ対応
-- ❌ 画像のデコード/エンコード（DCT=JPEG, JPX など）— 生データ取得は可能
+- ❌ 画像: progressive JPEG / JPXDecode / CCITTFaxDecode / JBIG2Decode は
+  デコード不可（レンダリングでは読み飛ばし。生データ取得は可能）
+- ❌ レンダリング: `/Mask`（ステンシル・カラーキー）、シェーディング（`sh`）、
+  透明グループ・ブレンドモード、Type3 フォント、画像境界のアンチエイリアス
+- ❌ CFF/Type1 フォントの描画はシステムフォント代替による近似
 - ❌ 増分更新での保存（電子署名は保存すると無効になる）
 - ❌ レイアウト解析 — テキスト抽出は読み上げ順のヒューリスティック
 - ❌ ToUnicode の無い CID フォント、`/Differences` エンコーディングは近似

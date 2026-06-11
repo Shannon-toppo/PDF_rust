@@ -1,9 +1,0 @@
-(function() {
-    var implementors = Object.fromEntries([["pdf_rust",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.93.0/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"pdf_rust/document/struct.Document.html\" title=\"struct pdf_rust::document::Document\">Document</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.93.0/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"pdf_rust/document/struct.DrawOptions.html\" title=\"struct pdf_rust::document::DrawOptions\">DrawOptions</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.93.0/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"pdf_rust/document/struct.TextOptions.html\" title=\"struct pdf_rust::document::TextOptions\">TextOptions</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.93.0/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"pdf_rust/object/struct.Dictionary.html\" title=\"struct pdf_rust::object::Dictionary\">Dictionary</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.93.0/core/default/trait.Default.html\" title=\"trait core::default::Default\">Default</a> for <a class=\"struct\" href=\"pdf_rust/xref/struct.Xref.html\" title=\"struct pdf_rust::xref::Xref\">Xref</a>"]]]]);
-    if (window.register_implementors) {
-        window.register_implementors(implementors);
-    } else {
-        window.pending_implementors = implementors;
-    }
-})()
-//{"start":57,"fragment_lengths":[1434]}

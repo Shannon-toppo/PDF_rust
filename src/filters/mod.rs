@@ -10,6 +10,7 @@
 //! `DCTDecode`（JPEG）や `JPXDecode`（JPEG2000）は画像コーデックであり、
 //! データはそのまま画像ファイルとして扱えるためデコードせずにエラーを返す。
 
+pub mod dct;
 pub mod flate;
 
 use crate::error::{PdfError, Result};
