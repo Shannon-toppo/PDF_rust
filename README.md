@@ -57,7 +57,8 @@ cargo doc --open                                  # API ドキュメント
 
 ## ドキュメント
 
-- [REFERENCE.md](REFERENCE.md) — 使い方・API 一覧・PDF 形式の解説・内部設計
+- [doc/REFERENCE.md](doc/REFERENCE.md) — 使い方・API 一覧・PDF 形式の解説・内部設計
+- [doc/VIEWER_PLAN.md](doc/VIEWER_PLAN.md) — ビューワー実装フェーズ計画
 - `cargo doc --open` — 全 API の rustdoc（日本語コメント付き）
 
 ## 制限事項（抜粋）
@@ -71,4 +72,4 @@ cargo doc --open                                  # API ドキュメント
 - レンダリングは progressive JPEG / JPX / CCITT / JBIG2 の画像、
   シェーディング、透明グループが未対応（読み飛ばして描画継続）
 
-詳細は [REFERENCE.md の §5](REFERENCE.md#5-対応機能と制限事項) を参照。
+詳細は [doc/REFERENCE.md の §5](doc/REFERENCE.md#5-対応機能と制限事項) を参照。
