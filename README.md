@@ -40,11 +40,13 @@ doc.save("output.pdf")?;
   領域（タイル）レンダリング・協調キャンセル・バッファ再利用・品質切替も可能
 - **読み込み対応形式**: 古典 xref / クロスリファレンスストリーム /
   オブジェクトストリーム（PDF 1.5+）/ ハイブリッド / 破損 xref の自動再構築
+- **暗号化 PDF**: 標準セキュリティハンドラ V1/V2/V4（RC4-40/128・AES-128）と
+  V5 R6（AES-256）の復号に対応（`Document::from_bytes` は空ユーザーパスワード
+  を自動試行、`from_bytes_with_password` で任意 PW 指定可能）。再保存は平文化
 - **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,
   ASCIIHex, RunLength, baseline JPEG（DCTDecode）— すべて自前実装
-- **CFF / OpenType-CFF**: `CFF ` テーブル付き OTF と PDF `/FontFile3`
-  （`OpenType` / `Type1C` / `CIDFontType0C`）を Type 2 チャーストリング解釈器で
-  描画。hstem/vstem・hintmask・flex 系・callsubr/callgsubr・seac まで対応
+- **暗号プリミティブ**: MD5/RC4/AES-128/AES-256/SHA-256/384/512 を自前実装
+  （標準セキュリティハンドラ用）
 
 ## 使い方
 
@@ -66,7 +68,8 @@ cargo doc --open                                  # API ドキュメント
 
 ## 制限事項（抜粋）
 
-- 暗号化 PDF は未対応（明示的なエラーになる）
+- 暗号化 PDF は読み込みのみ対応（再保存は平文として出力。再暗号化はしない）。
+  非標準セキュリティハンドラと R5 暫定方式は未対応
 - 保存は常に完全書き直し（増分更新ではない）
 - フォント埋め込み（`add_text_with_font`）は TrueType（glyf アウトライン）/TTC のみ。
   CFF アウトライン（`.otf` / OpenType-CFF）は埋め込み（サブセット化）非対応で
