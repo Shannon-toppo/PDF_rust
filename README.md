@@ -71,9 +71,11 @@ cargo doc --open                                  # API ドキュメント
 - 暗号化 PDF は読み込みのみ対応（再保存は平文として出力。再暗号化はしない）。
   非標準セキュリティハンドラと R5 暫定方式は未対応
 - 保存は常に完全書き直し（増分更新ではない）
-- フォント埋め込みは TrueType（glyf アウトライン）/TTC に対応
-  （`add_text_with_font` で日本語を含む Unicode 文字を描画可能）
-- CFF アウトライン（`.otf`）は未対応。`load_font_from_bytes` がエラーを返す
+- フォント埋め込み（`add_text_with_font`）は TrueType（glyf アウトライン）/TTC のみ。
+  CFF アウトライン（`.otf` / OpenType-CFF）は埋め込み（サブセット化）非対応で
+  `load_font_from_bytes` がエラーを返す。**ただし読み込み・レンダリングは対応**:
+  OTTO sfnt の `CFF ` テーブルと PDF `/FontFile3`（`OpenType` / `Type1C` /
+  `CIDFontType0C`）を Type 2 チャーストリング解釈器で描画できる
 - 縦書き（Identity-V）は未対応
 - レンダリングは progressive JPEG / JPX / CCITT / JBIG2 の画像、
   シェーディング、透明グループが未対応（読み飛ばして描画継続）

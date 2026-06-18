@@ -133,7 +133,7 @@ doc.save("edited.pdf")?;     // 完全書き直しで保存
 | `doc.append_content_bytes(index, bytes)` | 生バイトのコンテントを追記（最低レベル） |
 | `doc.ensure_standard_font(index, font)` | 標準フォントをリソース登録し名前を返す |
 | `doc.load_font(path)` | TrueType/TTC ファイルを読み込み、埋め込みフォントを登録。[`EmbeddedFontId`] を返す |
-| `doc.load_font_from_bytes(data, ttc_index)` | バイト列からフォントを登録（CFF は `PdfError::Font` エラー） |
+| `doc.load_font_from_bytes(data, ttc_index)` | バイト列からフォントを登録（埋め込み目的。CFF は `PdfError::Font` エラー。読み込み・描画は対応） |
 | `doc.add_text_with_font(index, text, font_id, &TextOptions)` | 埋め込みフォントでテキスト描画（`\n` で複数行）。`opts.font` は無視される |
 | `doc.text_width(font_id, text, size)` | 埋め込みフォントで描画幅（ポイント）を概算。`\n` はスキップ |
 
@@ -393,7 +393,8 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `interactive` | ビューワー機能。しおり（/Outlines）、リンク注釈、宛先解決（明示配列・名前付き）、ページラベル（/PageLabels 数値ツリー） |
 | `search` | テキスト検索。スパン連結（境界箱中心による同一行判定 + 隙間/行境界への空白仮定）→ リテラル照合 → 行ごとのハイライト矩形マージ |
 | `font` | 標準 14 フォントの幅テーブル（AFM 由来）、WinAnsi ⇔ Unicode |
-| `truetype` | TTF/TTC パーサ。cmap format 4/12、hmtx/head/hhea/maxp/OS∕ 2/post/name/loca/glyf |
+| `truetype` | TTF/TTC パーサ。cmap format 4/12、hmtx/head/hhea/maxp/OS∕ 2/post/name/loca/glyf。OTTO sfnt は `CFF ` テーブルを `cff` 経由でデコード |
+| `cff` | CFF（Compact Font Format）パーサと Type 2 チャーストリング解釈器。CFF / OpenType-CFF / `/FontFile3`（OpenType・Type1C・CIDFontType0C）対応 |
 | `subset` | TrueType サブセッタ。グリフ閉包（composite 対応）、sparse glyf、チェックサム再計算 |
 | `writer` | シリアライザ。実数の正規化、文字列/名前のエスケープ、xref 生成、`/ID` 生成（FNV-1a） |
 | `filters::dct` | baseline JPEG（DCTDecode）デコーダ。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
@@ -484,7 +485,8 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
   デコード不可（レンダリングでは読み飛ばし。生データ取得は可能）
 - ❌ レンダリング: `/Mask`（ステンシル・カラーキー）、シェーディング（`sh`）、
   透明グループ・ブレンドモード、Type3 フォント、画像境界のアンチエイリアス
-- ❌ CFF/Type1 フォントの描画はシステムフォント代替による近似
+- ⚠️ CFF（`.otf` / FontFile3 の OpenType・Type1C・CIDFontType0C）は
+  自前の Type 2 解釈器で描画可能。Type1（旧式 eexec）はシステムフォント代替の近似
 - ❌ 増分更新での保存（電子署名は保存すると無効になる）
 - ❌ レイアウト解析 — テキスト抽出は読み上げ順のヒューリスティック
 - ❌ ToUnicode の無い CID フォント、`/Differences` エンコーディングは近似

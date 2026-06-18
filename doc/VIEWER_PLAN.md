@@ -158,7 +158,17 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
 優先順: CFF → 暗号化（空パスワード優先）→ シェーディング → 透明度 → CCITT。
 「手元の実 PDF が表示できない」事例ドリブンで進める。
 
-- [ ] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
+- [x] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
+      — `src/cff.rs`（CFF パーサ + Type 2 解釈器）と `src/cff_strings.rs`
+      （SID 標準文字列表 391 件）。OTTO sfnt の `CFF ` テーブル経由と
+      `/FontFile3`（`OpenType` / `Type1C` / `CIDFontType0C`）経由の両方を
+      `TrueTypeFont` 経由でレンダラから扱える。Type 2 演算子は hstem/vstem・
+      hintmask・rrcurveto・hvcurveto/vhcurveto/vvcurveto/hhcurveto・rcurveline/
+      rlinecurve・flex/hflex/hflex1/flex1・callsubr/callgsubr・seac 互換の
+      endchar まで対応。CharstringType 2 のみ受け付け、Type1 eexec（旧式）と
+      CFF2 は明示的に拒否する。検証: cff::tests（10）+ tests/cff_integration.rs
+      で OTTO sfnt（Source Han Sans JP）の `'A'` / `'あ'` の outline デコードを
+      確認
 - [ ] Type3 フォント（コンテントストリームの再帰描画）
 - [x] 暗号化 PDF: RC4/AES-128/AES-256 + MD5/SHA-2 自前実装（2026-06-19 完了。
       V1/R2・V2/R3・V4/R4（RC4-128 / AESV2）・V5/R6（AESV3）に対応。
