@@ -46,6 +46,8 @@
 //! | [`xref`] | 相互参照テーブル（古典 / xref ストリーム / 再構築） |
 //! | [`filters`] | ストリームフィルタ（Flate, LZW, ASCII85, RunLength…） |
 //! | [`content`] | コンテントストリームの解析・生成 |
+//! | [`crypto`] | 自前実装の暗号プリミティブ（MD5/RC4/AES-128/256/SHA-2） |
+//! | [`security`] | PDF 標準セキュリティハンドラ（V1/V2/V4/V5 復号） |
 //! | [`function`] | PDF 関数インタプリタ（Type 0/2/3/4） |
 //! | [`text`] | テキスト抽出（ToUnicode CMap 対応・位置付きスパン） |
 //! | [`search`] | テキスト検索（スパン跨ぎ照合・行単位ハイライト矩形） |
@@ -58,7 +60,10 @@
 //!
 //! ## 制限事項
 //!
-//! - 暗号化 PDF は読めない（[`PdfError::EncryptionNotSupported`]）
+//! - 暗号化 PDF（標準セキュリティハンドラ）はユーザーパスワード認証で
+//!   読み込み可能（V1/V2/V4 の RC4・AES-128、V5 R6 の AES-256）。
+//!   非対応のフィルタや R5 暫定方式は明示的にエラー。
+//!   再保存は復号後の平文として出力する（再暗号化はしない）
 //! - 保存は常に完全書き直し（増分更新・電子署名の保持は不可）
 //! - テキスト抽出は ToUnicode CMap か WinAnsi 相当の単純フォントが対象。
 //!   ToUnicode を持たない CID フォントや `/Differences` は近似になる
@@ -71,6 +76,7 @@
 //!   CFF/Type1 のテキストはシステムフォント代替で近似描画する
 
 pub mod content;
+pub mod crypto;
 pub mod document;
 pub mod encoding;
 pub mod error;
@@ -83,6 +89,7 @@ pub mod object;
 pub mod parser;
 pub mod render;
 pub mod search;
+pub mod security;
 pub mod subset;
 pub mod text;
 pub mod truetype;

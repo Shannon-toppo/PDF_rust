@@ -103,7 +103,10 @@ fn apply_filter(
         "DCTDecode" | "DCT" | "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode" => Err(err(
             format!("image codec filter /{name} is not decoded (use raw data)"),
         )),
-        "Crypt" => Err(PdfError::EncryptionNotSupported),
+        // /Crypt フィルタは「このストリームは別途指定された CFM で復号する」
+        // という指示。本ライブラリはストリーム本体の復号を読み込み時に行うため、
+        // ここに辿り着く時点で平文。/Identity 扱いで通す。
+        "Crypt" => Ok(data.to_vec()),
         other => Err(err(format!("unknown filter /{other}"))),
     }
 }

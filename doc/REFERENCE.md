@@ -257,7 +257,8 @@ doc.append_content(0, &ops)?;
 | `TypeMismatch` | 期待した型と違う |
 | `MissingKey` | 辞書の必須キー欠落 |
 | `Filter` | ストリーム伸長失敗 |
-| `EncryptionNotSupported` | 暗号化 PDF |
+| `EncryptionNotSupported` | 標準ハンドラ外の暗号化 PDF（保留: 通常パスでは出ない） |
+| `Cancelled` | レンダリング協調キャンセル |
 | `PageOutOfRange` | ページ番号範囲外 |
 | `Invalid` | その他不正 |
 
@@ -472,7 +473,11 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
 
 ### 制限
 
-- ❌ 暗号化 PDF（RC4/AES）— 読み込み時に `EncryptionNotSupported`
+- ✅ 暗号化 PDF（標準セキュリティハンドラ）— V1/V2/V4（RC4-40/128・
+  AES-128）と V5/R6（AES-256）に対応。ユーザーパスワード認証（既定で
+  空文字列）。`Document::from_bytes_with_password` で任意 PW 指定可。
+  再保存は復号後の平文として書き出す（再暗号化はしない）。R5（非推奨）
+  と非標準 `/Filter` ハンドラは未対応
 - ❌ CFF アウトライン（`.otf`）— `load_font_from_bytes` が `PdfError::Font` を返す
 - ❌ 縦書き（Identity-V）— 横書き（Identity-H）のみ対応
 - ❌ 画像: progressive JPEG / JPXDecode / CCITTFaxDecode / JBIG2Decode は

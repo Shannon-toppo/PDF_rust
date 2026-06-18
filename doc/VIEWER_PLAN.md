@@ -160,7 +160,12 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
 
 - [ ] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
 - [ ] Type3 フォント（コンテントストリームの再帰描画）
-- [ ] 暗号化 PDF: RC4/AES-128/AES-256 + MD5/SHA-2 自前実装（空パスワード PDF は多い）
+- [x] 暗号化 PDF: RC4/AES-128/AES-256 + MD5/SHA-2 自前実装（2026-06-19 完了。
+      V1/R2・V2/R3・V4/R4（RC4-128 / AESV2）・V5/R6（AESV3）に対応。
+      ユーザーパスワード認証で復号、再保存は平文化。`tests/fixtures/gen_encrypted_pdfs.py`
+      で PyMuPDF から 4 種のフィクスチャを生成し、`extract_text` の一致で検証。
+      R6 ハードンドハッシュの終了条件は仕様の文言と Acrobat/mupdf 実装で
+      ラウンド番号の indexing が違うため、1-indexed 解釈を採用）
 - [ ] シェーディング（`sh`、axial/radial）・タイリングパターン
 - [ ] 透明度（ExtGState `CA`/`ca`、ブレンドモード、透明グループ）
 - [ ] CCITTFaxDecode / JBIG2（スキャン文書）。JPXDecode はスコープ外も妥当

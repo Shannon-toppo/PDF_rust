@@ -263,6 +263,11 @@ impl Dictionary {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 
+    /// `(キー, 値)` の可変イテレータ。
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut Object)> {
+        self.entries.iter_mut().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// 必須キーを取得する。なければ [`PdfError::MissingKey`]。
     pub fn require(&self, key: &'static str) -> Result<&Object> {
         self.get(key).ok_or(PdfError::MissingKey(key))

@@ -87,24 +87,40 @@ impl Document {
     /// バイト列から読み込む。
     ///
     /// xref が壊れている場合は全ファイル走査による再構築を試みる。
+    /// 暗号化 PDF はユーザーパスワードが空のものを自動で復号する。
+    /// 空でないパスワードが必要な PDF は [`from_bytes_with_password`](Self::from_bytes_with_password)。
     pub fn from_bytes(data: &[u8]) -> Result<Document> {
+        Self::from_bytes_with_password(data, b"")
+    }
+
+    /// パスワード指定で読み込む。
+    pub fn from_bytes_with_password(data: &[u8], password: &[u8]) -> Result<Document> {
         let version = parse_header_version(data)?;
-        let primary = Xref::load(data).and_then(|x| Self::build(data, x, version.clone()));
+        let primary =
+            Xref::load(data).and_then(|x| Self::build(data, x, version.clone(), password));
         match primary {
             Ok(doc) => Ok(doc),
             Err(PdfError::EncryptionNotSupported) => Err(PdfError::EncryptionNotSupported),
+            Err(PdfError::Invalid(ref m)) if m.contains("non-empty password") => {
+                Err(PdfError::Invalid(m.clone()))
+            }
             Err(_) => {
                 let x = xref::reconstruct(data)?;
-                Self::build(data, x, version)
+                Self::build(data, x, version, password)
             }
         }
     }
 
     /// xref に従ってすべてのオブジェクトを読み込む。
-    fn build(data: &[u8], xref: Xref, version: String) -> Result<Document> {
-        if xref.trailer.get("Encrypt").is_some() {
-            return Err(PdfError::EncryptionNotSupported);
-        }
+    fn build(data: &[u8], xref: Xref, version: String, password: &[u8]) -> Result<Document> {
+        // /Encrypt があれば、対応するオブジェクト ID を覚えておく
+        // （後段でセキュリティハンドラを構築する。/Encrypt 自身は復号しない）。
+        let encrypt_ref: Option<ObjectId> = match xref.trailer.get("Encrypt") {
+            Some(Object::Reference(id)) => Some(*id),
+            Some(Object::Dictionary(_)) => None, // 直接埋め込みは稀。後で対応する
+            _ => None,
+        };
+        let has_encrypt = xref.trailer.get("Encrypt").is_some();
 
         // /Length 間接参照の解決用: xref から番号を引いて単純オブジェクトを読む
         let length_resolver = |id: ObjectId| -> Option<i64> {
@@ -133,6 +149,58 @@ impl Document {
                     }
                     // 番号不一致・解析失敗のエントリは無視（後段の再構築に任せる）
                     _ => {}
+                }
+            }
+        }
+
+        // 暗号化されている場合: 直置きオブジェクトの文字列とストリームを復号する。
+        // ObjStm の中身（圧縮オブジェクト）は外側ストリームの復号だけで足り、
+        // 中の文字列は再度復号しない（§7.6.2）ので、第 2 段階より前に行う。
+        if has_encrypt {
+            let ids: Vec<Vec<u8>> = xref
+                .trailer
+                .get("ID")
+                .and_then(|o| match o {
+                    Object::Array(a) => Some(a.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|o| match o {
+                    Object::String(b, _) => Some(b),
+                    _ => None,
+                })
+                .collect();
+            // /Encrypt 辞書を取得（直接 or 間接）。
+            let encrypt_dict: Option<Dictionary> = match xref.trailer.get("Encrypt") {
+                Some(Object::Dictionary(d)) => Some(d.clone()),
+                Some(Object::Reference(id)) => match objects.get(id) {
+                    Some(Object::Dictionary(d)) => Some(d.clone()),
+                    Some(Object::Stream(s)) => Some(s.dict.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(enc) = encrypt_dict {
+                let resolve = |o: &Object| -> Object {
+                    match o {
+                        Object::Reference(id) => objects.get(id).cloned().unwrap_or(Object::Null),
+                        other => other.clone(),
+                    }
+                };
+                let handler = crate::security::StandardHandler::new(&enc, &ids, password, resolve)?;
+                let skip_id = encrypt_ref;
+                // 各間接オブジェクトを復号する。
+                let ids_to_decrypt: Vec<ObjectId> = objects
+                    .keys()
+                    .copied()
+                    .filter(|id| Some(*id) != skip_id)
+                    .collect();
+                for id in ids_to_decrypt {
+                    if let Some(mut obj) = objects.remove(&id) {
+                        decrypt_object_in_place(&mut obj, id, &handler);
+                        objects.insert(id, obj);
+                    }
                 }
             }
         }
@@ -228,8 +296,17 @@ impl Document {
             "Length",
             "Filter",
             "DecodeParms",
+            // 復号済みなので /Encrypt 参照を取り除く。/Encrypt 辞書自体は
+            // 孤立した間接オブジェクトとして残るが、無害（参照されない）。
+            "Encrypt",
         ] {
             trailer.remove(k);
+        }
+        if has_encrypt {
+            // /ID は新規 PDF として書き直すため新しいものを生成しても良いが、
+            // 既存のものを残しておく方が他ツールとの互換性が高い。
+            // ただし暗号化された PDF を平文として保存することになる旨は
+            // ドキュメントに明記する。
         }
         let next_id = objects.keys().map(|(n, _)| *n).max().unwrap_or(0) + 1;
         let doc = Document {
@@ -1547,6 +1624,65 @@ pub fn encode_text_string(s: &str) -> Vec<u8> {
             out.extend_from_slice(&unit.to_be_bytes());
         }
         out
+    }
+}
+
+/// 間接オブジェクト `obj`（オブジェクト ID = `owner`）の中身を再帰的に復号する。
+/// 文字列はその場で復号後の内容に置き換える。ストリームの場合、辞書内の
+/// 文字列も復号した上でストリーム本体も復号する（ただし `/Type /XRef` と
+/// `/Type /Metadata` で `/EncryptMetadata false` の場合は本体を復号しない）。
+fn decrypt_object_in_place(
+    obj: &mut Object,
+    owner: ObjectId,
+    handler: &crate::security::StandardHandler,
+) {
+    decrypt_recursive(obj, owner, handler, true);
+}
+
+fn decrypt_recursive(
+    obj: &mut Object,
+    owner: ObjectId,
+    handler: &crate::security::StandardHandler,
+    is_root: bool,
+) {
+    match obj {
+        Object::String(bytes, _) => {
+            if let Ok(d) = handler.decrypt_string(owner, bytes) {
+                *bytes = d;
+            }
+        }
+        Object::Array(arr) => {
+            for o in arr.iter_mut() {
+                decrypt_recursive(o, owner, handler, false);
+            }
+        }
+        Object::Dictionary(dict) => {
+            for (_, v) in dict.iter_mut() {
+                decrypt_recursive(v, owner, handler, false);
+            }
+        }
+        Object::Stream(s) => {
+            // 辞書側はネスト構造として常に再帰。
+            for (_, v) in s.dict.iter_mut() {
+                decrypt_recursive(v, owner, handler, false);
+            }
+            // ストリーム本体は「この間接オブジェクト自体がストリーム」のときだけ
+            // 復号する（ネストの内部にストリームが現れることは事実上ない）。
+            if !is_root {
+                return;
+            }
+            // /Type /XRef は仕様上暗号化されない。
+            if let Some(Object::Name(t)) = s.dict.get("Type") {
+                if t == "XRef" {
+                    return;
+                }
+            }
+            // PKCS#5 パディング不正などで失敗した場合は元のまま残す（耐性優先）。
+            if let Ok(d) = handler.decrypt_stream(owner, &s.data) {
+                s.data = d;
+            }
+        }
+        _ => {}
     }
 }
 
