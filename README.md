@@ -42,6 +42,9 @@ doc.save("output.pdf")?;
   オブジェクトストリーム（PDF 1.5+）/ ハイブリッド / 破損 xref の自動再構築
 - **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,
   ASCIIHex, RunLength, baseline JPEG（DCTDecode）— すべて自前実装
+- **CFF / OpenType-CFF**: `CFF ` テーブル付き OTF と PDF `/FontFile3`
+  （`OpenType` / `Type1C` / `CIDFontType0C`）を Type 2 チャーストリング解釈器で
+  描画。hstem/vstem・hintmask・flex 系・callsubr/callgsubr・seac まで対応
 
 ## 使い方
 
@@ -65,9 +68,11 @@ cargo doc --open                                  # API ドキュメント
 
 - 暗号化 PDF は未対応（明示的なエラーになる）
 - 保存は常に完全書き直し（増分更新ではない）
-- フォント埋め込みは TrueType（glyf アウトライン）/TTC に対応
-  （`add_text_with_font` で日本語を含む Unicode 文字を描画可能）
-- CFF アウトライン（`.otf`）は未対応。`load_font_from_bytes` がエラーを返す
+- フォント埋め込み（`add_text_with_font`）は TrueType（glyf アウトライン）/TTC のみ。
+  CFF アウトライン（`.otf` / OpenType-CFF）は埋め込み（サブセット化）非対応で
+  `load_font_from_bytes` がエラーを返す。**ただし読み込み・レンダリングは対応**:
+  OTTO sfnt の `CFF ` テーブルと PDF `/FontFile3`（`OpenType` / `Type1C` /
+  `CIDFontType0C`）を Type 2 チャーストリング解釈器で描画できる
 - 縦書き（Identity-V）は未対応
 - レンダリングは progressive JPEG / JPX / CCITT / JBIG2 の画像、
   シェーディング、透明グループが未対応（読み飛ばして描画継続）

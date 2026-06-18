@@ -49,6 +49,10 @@ pub struct TrueTypeFont {
     /// (3,0) の format 4/0、または (1,0) の format 0 を保持する。
     /// 無ければ [`Cmap::None`]。
     symbolic_cmap: Cmap,
+    /// CFF テーブルがあればパース済みの CFF フォント。
+    /// OTTO sfnt（OpenType/CFF）と `FontFile3` の `OpenType`/`Type1C`/
+    /// `CIDFontType0C` で使う。glyf アウトラインがあるフォントでは `None`。
+    cff: Option<crate::cff::CffFont>,
 }
 
 /// グリフアウトラインの 1 セグメント。座標はフォント単位（y 上向き）。
@@ -58,8 +62,10 @@ pub enum OutlineSegment {
     MoveTo(f64, f64),
     /// 直線。
     LineTo(f64, f64),
-    /// 2 次ベジェ（制御点 x,y と終点 x,y）。
+    /// 2 次ベジェ（制御点 x,y と終点 x,y）。TrueType（glyf）で使う。
     QuadTo(f64, f64, f64, f64),
+    /// 3 次ベジェ（制御点 1・制御点 2・終点）。CFF（Type 2）で使う。
+    CurveTo(f64, f64, f64, f64, f64, f64),
     /// 輪郭を閉じる。
     Close,
 }
@@ -329,6 +335,17 @@ impl TrueTypeFont {
         // シンボリックフォント向けの cmap も別途解析する。
         let symbolic_cmap = parse_symbolic_cmap(&data, &tables);
 
+        // 11. CFF テーブル（OTTO sfnt）。glyf が無ければ CFF と仮定。
+        let cff = if let Some((cff_off, cff_len)) = table_slice(&tables, b"CFF ") {
+            if let Some(slice) = data.get(cff_off..cff_off + cff_len) {
+                crate::cff::CffFont::parse(slice.to_vec()).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(TrueTypeFont {
             data,
             tables,
@@ -345,7 +362,55 @@ impl TrueTypeFont {
             loca,
             cmap,
             symbolic_cmap,
+            cff,
         })
+    }
+
+    /// `FontFile3` の `Type1C` / `CIDFontType0C` / `OpenType` ストリームを
+    /// パースする。生 CFF データ（sfnt ラッパなし）を受け取り、合成 sfnt として
+    /// 振る舞う [`TrueTypeFont`] を作る。
+    ///
+    /// 合成の方針:
+    /// - units_per_em は CFF の FontMatrix の `m[0]` から `round(1.0 / m[0])` で算出
+    ///   （非埋め込みの典型値は 1000）。
+    /// - cmap・symbolic_cmap は空（CFF 側の charset で SID/CID → GID を引く）。
+    /// - hmtx は無い → `advance_width` は CFF 側の advance を返す。
+    /// - FontBBox・ascent/descent/cap_height は近似値。
+    pub fn parse_raw_cff(data: Vec<u8>) -> Result<TrueTypeFont> {
+        let cff = crate::cff::CffFont::parse(data.clone())?;
+        let m = cff.font_matrix();
+        let upm = if m[0] > 0.0 {
+            ((1.0 / m[0]).round() as u32).clamp(16, 65535) as u16
+        } else {
+            1000
+        };
+        let num_glyphs = cff.num_glyphs();
+        // 近似 FontBBox/ascent: CFF からは取り出さない（PDF 側 FontDescriptor を信頼）。
+        let ascent = (upm as i32 * 8) / 10;
+        let descent = -(upm as i32 * 2) / 10;
+        Ok(TrueTypeFont {
+            data,
+            tables: std::collections::HashMap::new(),
+            units_per_em: upm,
+            index_to_loc_format: 0,
+            num_glyphs,
+            font_bbox: [0, descent, upm as i32, ascent],
+            ascent,
+            descent,
+            cap_height: (ascent * 7) / 10,
+            italic_angle: 0.0,
+            num_h_metrics: 0,
+            post_script_name: String::from("EmbeddedCFF"),
+            loca: Vec::new(),
+            cmap: Cmap::None,
+            symbolic_cmap: Cmap::None,
+            cff: Some(cff),
+        })
+    }
+
+    /// 内蔵 [`crate::cff::CffFont`]（OTF/CFF または FontFile3）への参照。
+    pub fn cff(&self) -> Option<&crate::cff::CffFont> {
+        self.cff.as_ref()
     }
 
     /// 生のテーブルを取得する（タグは `b"glyf"` など）。
@@ -400,13 +465,23 @@ impl TrueTypeFont {
     }
 
     /// Unicode 文字 → グリフ ID。マップに無ければ `None`。
+    ///
+    /// 内蔵 CFF がある場合は、cmap で見つからなければ CFF の Unicode 表
+    /// （非 CID では charset の SID 名から AGL 経由で算出）を試す。
     pub fn glyph_id(&self, c: char) -> Option<u16> {
-        lookup(&self.cmap, c as u32)
+        if let Some(gid) = lookup(&self.cmap, c as u32) {
+            return Some(gid);
+        }
+        if let Some(cff) = &self.cff {
+            return cff.gid_by_unicode(c);
+        }
+        None
     }
 
     /// シンボリックフォント向け: 文字コードからグリフ ID を引く。
     /// (3,0)/(1,0) cmap を code → 0xF000+code の順で試し、
     /// 無ければ通常の Unicode cmap でも試す。
+    /// それでも見つからない場合は CFF の built-in Encoding を試す。
     pub fn glyph_id_by_code(&self, code: u32) -> Option<u16> {
         // 1. シンボリック cmap を code → 0xF000+code の順で試す。
         if let Some(gid) = lookup(&self.symbolic_cmap, code) {
@@ -426,22 +501,57 @@ impl TrueTypeFont {
                 return Some(gid);
             }
         }
+        // 3. CFF の built-in Encoding（非 CID）。
+        if let Some(cff) = &self.cff {
+            if code <= 0xFF {
+                if let Some(gid) = cff.gid_by_code(code as u8) {
+                    return Some(gid);
+                }
+            }
+        }
         None
+    }
+
+    /// グリフ名 → GID。`post` テーブルは未パースのため、現状は CFF 内蔵時のみ
+    /// CFF の charset 経由で解決する（非 CID の `/Differences` 解決に使う）。
+    pub fn glyph_id_by_name(&self, name: &str) -> Option<u16> {
+        self.cff.as_ref().and_then(|c| c.gid_by_name(name))
     }
 
     /// グリフの advance 幅（フォント単位）。
     /// `gid >= numberOfHMetrics` のときは最後のエントリの幅を使う（spec どおり）。
+    ///
+    /// hmtx が無い（生 CFF 等）場合は CFF チャーストリングの advance を
+    /// FontMatrix 経由でフォント単位に変換する。
     pub fn advance_width(&self, gid: u16) -> u16 {
         let default = self.units_per_em / 2;
-        if self.num_h_metrics == 0 {
-            return default;
+        // 1. sfnt の hmtx を優先（OTTO sfnt 付き CFF はここを通る）。
+        if self.num_h_metrics > 0 {
+            if let Some(w) = self.hmtx_advance(gid) {
+                return w;
+            }
         }
-        let Some((hmtx_off, hmtx_len)) = self.tables.get(b"hmtx").copied() else {
-            return default;
-        };
-        let Some(hmtx) = self.data.get(hmtx_off..hmtx_off + hmtx_len) else {
-            return default;
-        };
+        // 2. 生 CFF（hmtx 無し）は CFF の advance × upm。
+        if let Some(cff) = &self.cff {
+            if let Some((_, adv_cs)) = cff.glyph_outline_and_advance(gid) {
+                let upm = self.units_per_em as f64;
+                let w = adv_cs * upm * cff.font_matrix()[0];
+                let w = w.round();
+                if (0.0..=u16::MAX as f64).contains(&w) {
+                    return w as u16;
+                }
+            }
+        }
+        default
+    }
+
+    /// hmtx から advance を引く（無効なら `None`）。
+    fn hmtx_advance(&self, gid: u16) -> Option<u16> {
+        if self.num_h_metrics == 0 {
+            return None;
+        }
+        let (hmtx_off, hmtx_len) = self.tables.get(b"hmtx").copied()?;
+        let hmtx = self.data.get(hmtx_off..hmtx_off + hmtx_len)?;
         // gid < numberOfHMetrics ならエントリ gid、そうでなければ最後の advance。
         let index = if gid < self.num_h_metrics {
             gid as usize
@@ -449,10 +559,7 @@ impl TrueTypeFont {
             (self.num_h_metrics - 1) as usize
         };
         // 各エントリ {advanceWidth u16, lsb i16} = 4 バイト。
-        match index.checked_mul(4).and_then(|pos| read_u16(hmtx, pos)) {
-            Some(w) => w,
-            None => default,
-        }
+        index.checked_mul(4).and_then(|pos| read_u16(hmtx, pos))
     }
 
     /// グリフのアウトラインデータ（`glyf` テーブル内のバイト列）。
@@ -480,7 +587,26 @@ impl TrueTypeFont {
     ///
     /// 座標はフォント単位（y 上向き）。composite グリフは子を再帰展開して
     /// 変換を適用する（再帰深さ上限 5、コンポーネント数上限 64）。
+    ///
+    /// CFF を内蔵する場合（OTTO sfnt や FontFile3）は CFF チャーストリングを
+    /// 解釈し、FontMatrix × units_per_em でフォント単位に変換して返す。
     pub fn glyph_outline(&self, gid: u16) -> Option<Vec<OutlineSegment>> {
+        if let Some(cff) = &self.cff {
+            // CFF アウトラインは FontMatrix（既定 0.001）× upm でフォント単位化。
+            let raw = cff.glyph_outline(gid)?;
+            let upm = self.units_per_em as f64;
+            let m = cff.font_matrix();
+            // 合成行列: スケール = upm × m[0..4]、平行移動 = upm × m[4..6]。
+            let scaled = [
+                m[0] * upm,
+                m[1] * upm,
+                m[2] * upm,
+                m[3] * upm,
+                m[4] * upm,
+                m[5] * upm,
+            ];
+            return Some(crate::cff::transform_outline(&raw, &scaled));
+        }
         self.glyph_outline_depth(gid, 0)
     }
 
@@ -584,6 +710,13 @@ impl TrueTypeFont {
                             let (ncx, ncy) = tf(cx, cy);
                             let (nex, ney) = tf(ex, ey);
                             OutlineSegment::QuadTo(ncx, ncy, nex, ney)
+                        }
+                        OutlineSegment::CurveTo(c1x, c1y, c2x, c2y, ex, ey) => {
+                            // glyf 由来の composite には来ないが、API の網羅のため。
+                            let (n1x, n1y) = tf(c1x, c1y);
+                            let (n2x, n2y) = tf(c2x, c2y);
+                            let (nex, ney) = tf(ex, ey);
+                            OutlineSegment::CurveTo(n1x, n1y, n2x, n2y, nex, ney)
                         }
                         OutlineSegment::Close => OutlineSegment::Close,
                     });
@@ -1898,6 +2031,11 @@ mod tests {
                 OutlineSegment::MoveTo(x, y) | OutlineSegment::LineTo(x, y) => check(x, y),
                 OutlineSegment::QuadTo(cx, cy, ex, ey) => {
                     check(cx, cy);
+                    check(ex, ey);
+                }
+                OutlineSegment::CurveTo(c1x, c1y, c2x, c2y, ex, ey) => {
+                    check(c1x, c1y);
+                    check(c2x, c2y);
                     check(ex, ey);
                 }
                 OutlineSegment::Close => {}
