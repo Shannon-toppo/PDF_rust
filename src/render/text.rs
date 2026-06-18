@@ -100,7 +100,18 @@ impl RenderFont {
         if self.two_byte {
             // CID = コード（Identity 前提）。
             match &self.cid_to_gid {
-                None => Some(code as u16),
+                None => {
+                    // CID キー付き CFF（CIDFontType0C）は charset 経由で CID → GID。
+                    if let Some(cff) = self.program.as_ref().and_then(|p| p.cff()) {
+                        if cff.is_cid() {
+                            if let Some(gid) = cff.gid_for_cid(code as u16) {
+                                return Some(gid);
+                            }
+                            // 解決できなければ Identity（仕様外だが多くの PDF はこれで読める）。
+                        }
+                    }
+                    Some(code as u16)
+                }
                 Some(map) => {
                     let pos = (code as usize).checked_mul(2)?;
                     let hi = *map.get(pos)?;
@@ -150,6 +161,7 @@ impl FontCache {
     }
 
     /// システムフォントファイルを読み込み・パースして（キャッシュ経由で）返す。
+    /// 代替フォントは描画専用なので OTF（CFF）も受け入れる。
     fn load_system(&mut self, path: &str) -> Option<Rc<TrueTypeFont>> {
         if let Some(cached) = self.files.get(path) {
             return cached.clone();
@@ -157,13 +169,12 @@ impl FontCache {
         let parsed = std::fs::read(path)
             .ok()
             .and_then(|data| TrueTypeFont::parse(data, 0).ok())
-            .filter(|f| !f.is_cff())
             .map(Rc::new);
         self.files.insert(path.to_string(), parsed.clone());
         parsed
     }
 
-    /// 埋め込み FontFile2 をパースして（キャッシュ経由で）返す。
+    /// 埋め込み FontFile2（TrueType sfnt）をパースして（キャッシュ経由で）返す。
     fn load_embedded(&mut self, data: Vec<u8>) -> Option<Rc<TrueTypeFont>> {
         // 簡易キー: 長さ + 先頭 8 バイト + 末尾 8 バイト。
         let key = embed_key(&data);
@@ -174,6 +185,26 @@ impl FontCache {
             .ok()
             .filter(|f| !f.is_cff())
             .map(Rc::new);
+        self.embedded.insert(key, parsed.clone());
+        parsed
+    }
+
+    /// 埋め込み FontFile3 をパースする。
+    ///
+    /// `subtype` が `OpenType` なら OTTO sfnt として、`Type1C` / `CIDFontType0C`
+    /// なら生 CFF として解析する。失敗時は `None`。
+    fn load_embedded_cff(&mut self, data: Vec<u8>, subtype: &str) -> Option<Rc<TrueTypeFont>> {
+        // データ + subtype を含めたキー（同じバイトでも経路が違う可能性は低いが念のため）。
+        let key = embed_key(&data) ^ embed_key(subtype.as_bytes());
+        if let Some(cached) = self.embedded.get(&key) {
+            return cached.clone();
+        }
+        let parsed = match subtype {
+            "OpenType" => TrueTypeFont::parse(data, 0).ok().filter(|f| f.is_cff()),
+            // Type1C / CIDFontType0C / 不明な subtype は生 CFF として試す。
+            _ => TrueTypeFont::parse_raw_cff(data).ok(),
+        }
+        .map(Rc::new);
         self.embedded.insert(key, parsed.clone());
         parsed
     }
@@ -348,7 +379,7 @@ fn load_program_from_descriptor(
 ) -> Option<Rc<TrueTypeFont>> {
     let descriptor = font_descriptor(doc, descriptor_owner);
 
-    // 1. 埋め込み FontFile2。
+    // 1. 埋め込み FontFile2（TrueType）。
     if let Some(desc) = &descriptor {
         if let Some(Object::Stream(s)) = doc.dict_get(desc, "FontFile2") {
             if let Ok(data) = doc.get_stream_data(s) {
@@ -357,7 +388,21 @@ fn load_program_from_descriptor(
                 }
             }
         }
-        // /FontFile3（CFF）・/FontFile（Type1）は描画不可 → 代替へ。
+        // 2. 埋め込み FontFile3（CFF / OpenType-CFF）。
+        if let Some(Object::Stream(s)) = doc.dict_get(desc, "FontFile3") {
+            let subtype = s
+                .dict
+                .get("Subtype")
+                .and_then(|o| o.as_name().ok())
+                .unwrap_or("")
+                .to_string();
+            if let Ok(data) = doc.get_stream_data(s) {
+                if let Some(font) = cache.load_embedded_cff(data, &subtype) {
+                    return Some(font);
+                }
+            }
+        }
+        // /FontFile（Type1 eexec）は描画不可 → 代替へ。
     }
 
     // 2. システムフォント代替。
@@ -472,6 +517,10 @@ fn resolve_difference_gid(font: &TrueTypeFont, code: u8, name: &str) -> u16 {
         if let Some(gid) = font.glyph_id(c) {
             return gid;
         }
+    }
+    // CFF（非 CID）は charset の名前から直接引ける。
+    if let Some(gid) = font.glyph_id_by_name(name) {
+        return gid;
     }
     font.glyph_id_by_code(code as u32).unwrap_or(0)
 }

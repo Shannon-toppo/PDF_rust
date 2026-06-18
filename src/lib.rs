@@ -53,6 +53,7 @@
 //! | [`font`] | 標準 14 フォントのメトリクスと WinAnsi 変換 |
 //! | [`encoding`] | 単純フォントのエンコーディング解決（Standard/MacRoman/グリフ名） |
 //! | [`truetype`] / [`subset`] | TrueType パーサ（glyf アウトライン込み）とサブセッタ |
+//! | [`cff`] | CFF（Compact Font Format）パーサと Type 2 チャーストリング解釈器 |
 //! | [`render`] | ラスタライザ（ベクタ図形 + TrueType テキスト描画 → [`Pixmap`]） |
 //! | [`writer`] | シリアライザ（保存処理の実体） |
 //!
@@ -70,6 +71,7 @@
 //!   シェーディング・透明度（ブレンドモード・透明グループ）は未対応。
 //!   CFF/Type1 のテキストはシステムフォント代替で近似描画する
 
+pub mod cff;
 pub mod content;
 pub mod document;
 pub mod encoding;
@@ -89,6 +91,7 @@ pub mod truetype;
 pub mod writer;
 pub mod xref;
 
+pub use cff::CffFont;
 pub use content::Operation;
 pub use document::{
     decode_text_string, encode_text_string, Document, DrawOptions, EmbeddedFontId, TextOptions,

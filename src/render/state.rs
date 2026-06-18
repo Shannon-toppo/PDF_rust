@@ -1331,6 +1331,10 @@ fn outline_to_path(outline: &[OutlineSegment]) -> Path {
                 path.curve_to(c1x, c1y, c2x, c2y, ex, ey);
                 cur = (ex, ey);
             }
+            OutlineSegment::CurveTo(c1x, c1y, c2x, c2y, ex, ey) => {
+                path.curve_to(c1x, c1y, c2x, c2y, ex, ey);
+                cur = (ex, ey);
+            }
             OutlineSegment::Close => path.close(),
         }
     }
