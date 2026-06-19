@@ -7,15 +7,17 @@
 //! - `RunLengthDecode`
 //! - `LZWDecode`（predictor 対応）
 //! - `CCITTFaxDecode`（T.4 1D / T.4 2D / T.6。[`ccitt`] モジュール）
+//! - `JBIG2Decode`（ISO 14492 / T.88。[`jbig2`] モジュール。Generic / Symbol /
+//!   Text / Halftone region と Huffman / 算術両経路、`/JBIG2Globals` 対応）
 //!
 //! `DCTDecode`（JPEG）や `JPXDecode`（JPEG2000）は画像コーデックであり、
 //! データはそのまま画像ファイルとして扱えるためデコードせずにエラーを返す
-//! （描画パスでは画像 XObject 側で個別にデコードする）。`JBIG2Decode` は
-//! 未対応。
+//! （描画パスでは画像 XObject 側で個別にデコードする）。
 
 pub mod ccitt;
 pub mod dct;
 pub mod flate;
+pub mod jbig2;
 
 use crate::error::{PdfError, Result};
 use crate::object::{Dictionary, Object};
@@ -108,8 +110,11 @@ fn apply_filter(
             let params = parms.map(ccitt::params_from_dict).unwrap_or_default();
             ccitt::decode(data, &params)
         }
+        // JBIG2Decode: ISO 14492 / T.88。/JBIG2Globals が DecodeParms にあれば
+        // resolver で参照解決して連結処理する
+        "JBIG2Decode" | "JBIG2" => jbig2::decode(data, parms, resolve),
         // 画像コーデック: ストリーム単位ではデコードしない（描画側で個別処理）
-        "DCTDecode" | "DCT" | "JPXDecode" | "JBIG2Decode" => Err(err(format!(
+        "DCTDecode" | "DCT" | "JPXDecode" => Err(err(format!(
             "image codec filter /{name} is not decoded (use raw data)"
         ))),
         // /Crypt フィルタは「このストリームは別途指定された CFM で復号する」
