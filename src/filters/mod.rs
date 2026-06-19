@@ -6,10 +6,14 @@
 //! - `ASCII85Decode`
 //! - `RunLengthDecode`
 //! - `LZWDecode`（predictor 対応）
+//! - `CCITTFaxDecode`（T.4 1D / T.4 2D / T.6。[`ccitt`] モジュール）
 //!
 //! `DCTDecode`（JPEG）や `JPXDecode`（JPEG2000）は画像コーデックであり、
-//! データはそのまま画像ファイルとして扱えるためデコードせずにエラーを返す。
+//! データはそのまま画像ファイルとして扱えるためデコードせずにエラーを返す
+//! （描画パスでは画像 XObject 側で個別にデコードする）。`JBIG2Decode` は
+//! 未対応。
 
+pub mod ccitt;
 pub mod dct;
 pub mod flate;
 
@@ -99,10 +103,15 @@ fn apply_filter(
         "ASCIIHexDecode" | "AHx" => ascii_hex_decode(data),
         "ASCII85Decode" | "A85" => ascii85_decode(data),
         "RunLengthDecode" | "RL" => run_length_decode(data),
-        // 画像コーデックはデコード対象外
-        "DCTDecode" | "DCT" | "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode" => Err(err(
-            format!("image codec filter /{name} is not decoded (use raw data)"),
-        )),
+        // CCITTFaxDecode: T.4 / T.6 を /DecodeParms に従って復号する
+        "CCITTFaxDecode" | "CCF" => {
+            let params = parms.map(ccitt::params_from_dict).unwrap_or_default();
+            ccitt::decode(data, &params)
+        }
+        // 画像コーデック: ストリーム単位ではデコードしない（描画側で個別処理）
+        "DCTDecode" | "DCT" | "JPXDecode" | "JBIG2Decode" => Err(err(format!(
+            "image codec filter /{name} is not decoded (use raw data)"
+        ))),
         // /Crypt フィルタは「このストリームは別途指定された CFM で復号する」
         // という指示。本ライブラリはストリーム本体の復号を読み込み時に行うため、
         // ここに辿り着く時点で平文。/Identity 扱いで通す。
