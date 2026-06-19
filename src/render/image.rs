@@ -14,9 +14,9 @@
 //! | /Decode | 任意の成分再写像（ImageMask の `[1 0]` 反転含む） |
 //! | /ImageMask | 1bpc ステンシル（塗り色で塗る） |
 //! | /SMask | 別画像（DeviceGray）をアルファチャネルにする。サイズ違いは最近傍リサンプル |
-//! | /Filter | Flate/LZW/ASCII85/ASCIIHex/RunLength + 末尾 DCTDecode（JPEG） |
+//! | /Filter | Flate/LZW/ASCII85/ASCIIHex/RunLength/CCITTFax + 末尾 DCTDecode（JPEG） |
 //! | /Mask（ステンシル・カラーキー） | **非対応**（無視して不透明に描く） |
-//! | JPXDecode / CCITTFax / JBIG2 / progressive JPEG | **非対応**（描画せず読み飛ばす） |
+//! | JPXDecode / JBIG2 / progressive JPEG | **非対応**（描画せず読み飛ばす） |
 //!
 //! ## サンプリングと境界
 //!
@@ -198,13 +198,11 @@ pub(crate) fn decode_image(
         .last()
         .map(|f| matches!(f.as_str(), "DCTDecode" | "DCT"))
         .unwrap_or(false);
-    // 非対応の画像コーデックは描画しない。
-    if filters.iter().any(|f| {
-        matches!(
-            f.as_str(),
-            "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode"
-        )
-    }) {
+    // 非対応の画像コーデックは描画しない（JPX/JBIG2 のみ。CCITT は対応済み）。
+    if filters
+        .iter()
+        .any(|f| matches!(f.as_str(), "JPXDecode" | "JBIG2Decode"))
+    {
         return None;
     }
 

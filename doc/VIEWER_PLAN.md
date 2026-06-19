@@ -157,7 +157,7 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
 
 優先順: CFF → 暗号化（空パスワード優先）→ シェーディング → 透明度 → CCITT。
 「手元の実 PDF が表示できない」事例ドリブンで進める。
-現状: CFF・暗号化・シェーディング・透明度まで完了（2026-06-19）。
+現状: CFF・暗号化・シェーディング・透明度・CCITT まで完了（2026-06-19）。
 
 - [x] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
       — `src/cff.rs`（CFF パーサ + Type 2 解釈器）と `src/cff_strings.rs`
@@ -200,7 +200,17 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
       ユニット 4（不透明/透明バッファの合成、composite_from）+ state
       ユニット 4（`/ca`・`/CA`・`/BM Multiply`・透明グループの 1 単位合成）。
       `/SMask`・isolated/knockout の細部は SMask は無視、isolated 扱い相当のみ）
-- [ ] CCITTFaxDecode / JBIG2（スキャン文書）。JPXDecode はスコープ外も妥当
+- [x] CCITTFaxDecode（スキャン文書）— `src/filters/ccitt.rs`。T.4 1D (MH)・
+      T.4 2D (MR)・T.6 (MMR) の全方式を 1 つのデコーダで処理する。`/K`
+      `Columns` `Rows` `EndOfBlock` `EndOfLine` `EncodedByteAlign` `BlackIs1`
+      の DecodeParms に対応。1bpp パックビットを出力し、画像 XObject /
+      ImageMask の双方で `decode_image` パスから利用可能。拡張 1D/2D
+      （uncommon）と JBIG2Decode は明示的に拒否。検証: ccitt ユニット 22
+      + 統合 9（フィルタ単体・配列フィルタ・略号 `/CCF`・XObject 描画・
+      ImageMask 描画・全黒行・保存→再読込で同一ピクセル）。JBIG2 は
+      仕様が極めて大きく（MQ コーダ・generic / text / halftone region・
+      symbol dictionary）、本プロジェクトの「依存ゼロ + フルスクラッチ」
+      方針では別 Phase に切り出すのが妥当としてここではスコープ外
 - [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
 - [ ] `/Mask`（ステンシル・カラーキー）
 - [ ] 縦書き（Identity-V。和文ビューワーとしては将来必要）
