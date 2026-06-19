@@ -19,6 +19,7 @@
 //! | `image` | 画像 XObject・インライン画像のデコードと描画（Phase 3 で追加） |
 //! | `shading` | シェーディング Type 2/3（Phase 6 で追加） |
 //! | `pattern` | タイリング／シェーディングパターン（Phase 6 で追加） |
+//! | [`blend`] | 透明度のブレンドモード（Phase 6 で追加） |
 //!
 //! ## 座標系
 //!
@@ -30,6 +31,7 @@
 //! 壊れた PDF・未対応の演算子に遭遇しても panic せず、解釈できる範囲で
 //! 描画を継続する（ライブラリ全体の方針と同じ）。
 
+pub mod blend;
 pub(crate) mod colorspace;
 pub(crate) mod image;
 pub mod path;
@@ -40,6 +42,7 @@ pub(crate) mod shading;
 pub mod state;
 pub(crate) mod text;
 
+pub use blend::BlendMode;
 pub use path::{Matrix, Path, Point};
 pub use pixmap::Pixmap;
 pub use raster::{fill_path, stroke_to_path, FillRule, LineCap, LineJoin, Mask, StrokeStyle};

@@ -18,6 +18,7 @@
 //! 確保するバッファはキャンバス幅に限定する。空パスや範囲外パスでも
 //! panic しない。
 
+use super::blend::BlendMode;
 use super::path::{Path, Point};
 use super::pixmap::Pixmap;
 
@@ -181,6 +182,34 @@ pub fn fill_path_aa(
     clip: Option<&Mask>,
     subsamples: u32,
 ) {
+    fill_path_aa_blended(
+        pm,
+        path,
+        rule,
+        rgb,
+        alpha,
+        clip,
+        subsamples,
+        BlendMode::Normal,
+    );
+}
+
+/// [`fill_path_aa`] のブレンドモード指定版（透明モデル対応）。
+///
+/// `mode` が [`BlendMode::Normal`] のときは [`fill_path_aa`] と等価。
+/// それ以外はピクセルごとに `Pixmap::blend_pixel_with` 経由で背景と
+/// ブレンドする。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_path_aa_blended(
+    pm: &mut Pixmap,
+    path: &Path,
+    rule: FillRule,
+    rgb: [u8; 3],
+    alpha: u8,
+    clip: Option<&Mask>,
+    subsamples: u32,
+    mode: BlendMode,
+) {
     if alpha == 0 {
         return;
     }
@@ -193,27 +222,27 @@ pub fn fill_path_aa(
             a = (a * mask.coverage(x, y) as u32 + 127) / 255;
         }
         if a > 0 {
-            pm.blend_pixel(x, y, rgb, a as u8);
+            pm.blend_pixel_with(x, y, rgb, a as u8, mode);
         }
     });
 }
 
-/// パスをラスタライズし、ピクセルごとに**シェーダ関数で色を決めて**塗る。
+/// パスをラスタライズし、ピクセルごとに**シェーダ関数で色を決めて**
+/// ブレンドモード `mode` で塗る。
 ///
 /// シェーディング・タイリングパターンによる塗りの実装。`shader(x, y)` は
 /// デバイス座標を受け取り、その点の RGB（または「シェーダ範囲外」を表す `None`）
-/// を返す。被覆率と `alpha` を掛けたアルファ値で `Pixmap` にソースオーバー合成する。
-///
-/// 通常品質は内部で [`SUBSAMPLES`] 本のサブスキャン、`subsamples` で本数を制御
-/// する（[`fill_path_aa`] と同じ仕様）。
+/// を返す。被覆率と `alpha` を掛けたアルファ値で `Pixmap` にブレンドモード
+/// `mode` で合成する。`subsamples` は [`fill_path_aa`] と同じ仕様。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fill_path_with_shader<F: FnMut(u32, u32) -> Option<[u8; 3]>>(
+pub(crate) fn fill_path_with_shader_blended<F: FnMut(u32, u32) -> Option<[u8; 3]>>(
     pm: &mut Pixmap,
     path: &Path,
     rule: FillRule,
     alpha: u8,
     clip: Option<&Mask>,
     subsamples: u32,
+    mode: BlendMode,
     mut shader: F,
 ) {
     if alpha == 0 {
@@ -232,7 +261,7 @@ pub(crate) fn fill_path_with_shader<F: FnMut(u32, u32) -> Option<[u8; 3]>>(
             a = (a * mask.coverage(x, y) as u32 + 127) / 255;
         }
         if a > 0 {
-            pm.blend_pixel(x, y, rgb, a as u8);
+            pm.blend_pixel_with(x, y, rgb, a as u8, mode);
         }
     });
 }

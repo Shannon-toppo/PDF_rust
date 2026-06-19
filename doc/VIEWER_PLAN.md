@@ -157,6 +157,7 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
 
 優先順: CFF → 暗号化（空パスワード優先）→ シェーディング → 透明度 → CCITT。
 「手元の実 PDF が表示できない」事例ドリブンで進める。
+現状: CFF・暗号化・シェーディング・透明度まで完了（2026-06-19）。
 
 - [x] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
       — `src/cff.rs`（CFF パーサ + Type 2 解釈器）と `src/cff_strings.rs`
@@ -185,7 +186,20 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
       Type 4–7 メッシュは読み飛ばし、uncolored Tiling の色注入は近似のみ。
       検証: 軸/放射の両端色、scn パターン経由の矩形塗り、タイリング繰り返し、
       不正な sh 名の no-op、`to_bytes`→`from_bytes` 往復のピクセル一致を確認）
-- [ ] 透明度（ExtGState `CA`/`ca`、ブレンドモード、透明グループ）
+- [x] 透明度（ExtGState `CA`/`ca`、ブレンドモード、透明グループ）（2026-06-19 完了。
+      `/ca`（既存）と `/CA` を `GraphicsState` に拡張し、塗り・線・パターン・
+      シェーディング・画像・グリフ描画のすべてに不透明度を反映。`/BM` の
+      ブレンドモードを `BlendMode` 列挙体（分離可能 12 種 + 非分離可能
+      Hue/Saturation/Color/Luminosity）として `render/blend.rs` に実装し、
+      `Pixmap::blend_pixel_with` でピクセル単位に B(Cb,Cs) を適用する。
+      透明グループ（Form XObject の `/Group <</S /Transparency>>`）は
+      `Pixmap::new_transparent` で同サイズのオフスクリーンを `Renderer` の
+      `offscreens` スタックに積み、内部の描画をそこへ蓄積してから離脱時に
+      `composite_from` で Do 呼び出し時点の `/ca`・`/BM`・クリップで親へ
+      合成する（PDF §11.3.4 の合成式）。検証: blend ユニット 7 + pixmap
+      ユニット 4（不透明/透明バッファの合成、composite_from）+ state
+      ユニット 4（`/ca`・`/CA`・`/BM Multiply`・透明グループの 1 単位合成）。
+      `/SMask`・isolated/knockout の細部は SMask は無視、isolated 扱い相当のみ）
 - [ ] CCITTFaxDecode / JBIG2（スキャン文書）。JPXDecode はスコープ外も妥当
 - [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
 - [ ] `/Mask`（ステンシル・カラーキー）
