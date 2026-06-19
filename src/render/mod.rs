@@ -17,6 +17,8 @@
 //! | `text` | 描画用フォントローダ（GID 解決・アウトライン取得。Phase 2 で追加） |
 //! | `colorspace` | PDF 色空間の解決と RGB 変換（Phase 3 で追加） |
 //! | `image` | 画像 XObject・インライン画像のデコードと描画（Phase 3 で追加） |
+//! | `shading` | シェーディング Type 2/3（Phase 6 で追加） |
+//! | `pattern` | タイリング／シェーディングパターン（Phase 6 で追加） |
 //!
 //! ## 座標系
 //!
@@ -31,8 +33,10 @@
 pub(crate) mod colorspace;
 pub(crate) mod image;
 pub mod path;
+pub(crate) mod pattern;
 pub mod pixmap;
 pub mod raster;
+pub(crate) mod shading;
 pub mod state;
 pub(crate) mod text;
 

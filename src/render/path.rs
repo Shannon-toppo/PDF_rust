@@ -109,6 +109,34 @@ impl Matrix {
         }
     }
 
+    /// 逆行列を返す。退化（行列式 0 や非有限）した場合は `None`。
+    ///
+    /// `image.rs` のサンプリングと同様、パターン・シェーディングが
+    /// デバイス座標からパターン空間へ写像する逆変換用。
+    pub fn inverse(&self) -> Option<Matrix> {
+        let det = self.a * self.d - self.b * self.c;
+        if !det.is_finite() || det == 0.0 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let a = self.d * inv_det;
+        let b = -self.b * inv_det;
+        let c = -self.c * inv_det;
+        let d = self.a * inv_det;
+        let e = (self.c * self.f - self.d * self.e) * inv_det;
+        let f = (self.b * self.e - self.a * self.f) * inv_det;
+        if !(a.is_finite()
+            && b.is_finite()
+            && c.is_finite()
+            && d.is_finite()
+            && e.is_finite()
+            && f.is_finite())
+        {
+            return None;
+        }
+        Some(Matrix { a, b, c, d, e, f })
+    }
+
     /// 平均的な拡大率の概算。線形部分の行列式の平方根
     /// （= 面積拡大率の平方根）で、平坦化トレランスをユーザー空間へ
     /// 換算する用途に使う。

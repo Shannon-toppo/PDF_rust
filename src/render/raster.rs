@@ -198,6 +198,45 @@ pub fn fill_path_aa(
     });
 }
 
+/// パスをラスタライズし、ピクセルごとに**シェーダ関数で色を決めて**塗る。
+///
+/// シェーディング・タイリングパターンによる塗りの実装。`shader(x, y)` は
+/// デバイス座標を受け取り、その点の RGB（または「シェーダ範囲外」を表す `None`）
+/// を返す。被覆率と `alpha` を掛けたアルファ値で `Pixmap` にソースオーバー合成する。
+///
+/// 通常品質は内部で [`SUBSAMPLES`] 本のサブスキャン、`subsamples` で本数を制御
+/// する（[`fill_path_aa`] と同じ仕様）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_path_with_shader<F: FnMut(u32, u32) -> Option<[u8; 3]>>(
+    pm: &mut Pixmap,
+    path: &Path,
+    rule: FillRule,
+    alpha: u8,
+    clip: Option<&Mask>,
+    subsamples: u32,
+    mut shader: F,
+) {
+    if alpha == 0 {
+        return;
+    }
+    let width = pm.width();
+    let height = pm.height();
+    let base = alpha as u32;
+    rasterize_with(path, rule, width, height, subsamples, |x, y, cov| {
+        let rgb = match shader(x, y) {
+            Some(c) => c,
+            None => return,
+        };
+        let mut a = (cov as u32 * base + 127) / 255;
+        if let Some(mask) = clip {
+            a = (a * mask.coverage(x, y) as u32 + 127) / 255;
+        }
+        if a > 0 {
+            pm.blend_pixel(x, y, rgb, a as u8);
+        }
+    });
+}
+
 /// 縦方向のサブスキャンライン本数（スーパーサンプリング係数）の既定値。
 const SUBSAMPLES: u32 = 4;
 

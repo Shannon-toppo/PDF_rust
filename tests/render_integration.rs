@@ -1033,3 +1033,87 @@ fn page_size_reflects_rotation() {
     // 範囲外は Err。
     assert!(doc.page_size(9).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: シェーディング・パターン
+// ---------------------------------------------------------------------------
+
+/// 軸方向シェーディング (`sh`) を Document 経由で描画する。
+///
+/// ページに `/Resources /Shading /Sh1` を直接登録し、コンテントから `sh` を
+/// 呼び出して、左端が黒・右端が赤になるグラデーションを確認する。
+#[test]
+fn render_axial_shading_via_document() {
+    use pdf_rust::object::{Dictionary, Object};
+
+    let mut doc = Document::new();
+    let page_id = doc.add_page(100.0, 50.0).unwrap();
+
+    // Type 2 関数（C0=黒、C1=赤）。
+    let mut func = Dictionary::new();
+    func.set("FunctionType", Object::Integer(2));
+    func.set(
+        "Domain",
+        Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+    );
+    func.set("N", Object::Integer(1));
+    func.set(
+        "C0",
+        Object::Array(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ]),
+    );
+    func.set(
+        "C1",
+        Object::Array(vec![
+            Object::Real(1.0),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ]),
+    );
+
+    // Shading 辞書（Axial、ユーザー座標 0..100 を補間範囲とする）。
+    let mut shading = Dictionary::new();
+    shading.set("ShadingType", Object::Integer(2));
+    shading.set("ColorSpace", Object::name("DeviceRGB"));
+    shading.set(
+        "Coords",
+        Object::Array(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(100.0),
+            Object::Real(0.0),
+        ]),
+    );
+    shading.set("Function", Object::Dictionary(func));
+
+    // /Resources /Shading /Sh1 をページに登録する。
+    let mut shadings = Dictionary::new();
+    shadings.set("Sh1", Object::Dictionary(shading));
+    let mut new_res = Dictionary::new();
+    new_res.set("Shading", Object::Dictionary(shadings));
+    {
+        let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        page.set("Resources", Object::Dictionary(new_res));
+    }
+
+    // 全画面に sh で塗る。
+    doc.append_content_bytes(0, b"/Sh1 sh".to_vec()).unwrap();
+    let pm = doc.render_page(0, 1.0).unwrap();
+
+    // 左端（user x=0 ≈ 黒）、右端（user x=100 ≈ 赤）。
+    let left = pm.pixel(2, 25).unwrap();
+    let right = pm.pixel(97, 25).unwrap();
+    assert!(left[0] < 30, "左端が黒くない: {:?}", left);
+    assert!(right[0] > 220, "右端が赤くない: {:?}", right);
+    assert_eq!(left[1], 0);
+    assert_eq!(right[1], 0);
+
+    // to_bytes → from_bytes 後も同じ描画になる（書き出し前後で /Resources /Shading が保たれる）。
+    let bytes = doc.to_bytes().unwrap();
+    let doc2 = Document::from_bytes(&bytes).unwrap();
+    let pm2 = doc2.render_page(0, 1.0).unwrap();
+    assert_eq!(pm.data(), pm2.data(), "往復後にピクセルが変化した");
+}

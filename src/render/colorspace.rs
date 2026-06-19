@@ -76,7 +76,17 @@ pub(crate) enum ColorSpace {
         /// tint 変換関数。
         tint: PdfFunction,
     },
-    /// 未対応色空間（Pattern など）。成分は無視して黒を返す。
+    /// Pattern 色空間（§8.7）。
+    ///
+    /// `cs /Pattern` または `cs [/Pattern BaseColorSpace]` で設定される。
+    /// `base = None` は colored Tiling および Shading パターン用（scn 引数は
+    /// パターン名のみ）、`base = Some(_)` は uncolored Tiling 用
+    /// （scn 引数はベース色成分 N 個 + パターン名）。
+    Pattern {
+        /// uncolored Tiling のベース色空間。colored / shading は `None`。
+        base: Option<Box<ColorSpace>>,
+    },
+    /// 未対応色空間。成分は無視して黒を返す。
     Unsupported,
 }
 
@@ -122,7 +132,8 @@ impl ColorSpace {
             "DeviceCMYK" | "CMYK" => ColorSpace::DeviceCMYK,
             // /I はインライン画像の省略名。配列形式でないと完全解決できないため Unsupported。
             "I" => ColorSpace::Unsupported,
-            "Pattern" => ColorSpace::Unsupported,
+            // 名前 /Pattern は colored Tiling / Shading パターン用（base なし）。
+            "Pattern" => ColorSpace::Pattern { base: None },
             // /Resources /ColorSpace 辞書を引いて再帰解決する。
             _ => {
                 let cs_dict = match doc.dict_get(resources, "ColorSpace") {
@@ -178,7 +189,18 @@ impl ColorSpace {
             // DeviceN: names + alt + tint（Separation の多成分版）。
             "DeviceN" => Self::parse_device_n(doc, arr, resources, depth),
 
-            "Pattern" => ColorSpace::Unsupported,
+            "Pattern" => {
+                // [/Pattern] または [/Pattern BaseCS]。
+                if arr.len() <= 1 {
+                    ColorSpace::Pattern { base: None }
+                } else {
+                    let base_obj = arr.get(1).cloned().unwrap_or(Object::Null);
+                    let base_cs = Self::parse_inner(doc, &base_obj, resources, depth + 1);
+                    ColorSpace::Pattern {
+                        base: Some(Box::new(base_cs)),
+                    }
+                }
+            }
             // 名前形式のフォールバック（配列の先頭が名前で要素が 1 つのケース）。
             name => {
                 if arr.len() == 1 {
@@ -395,6 +417,8 @@ impl ColorSpace {
             ColorSpace::Lab { .. } => 3,
             ColorSpace::Indexed { .. } => 1,
             ColorSpace::Separation { n, .. } => *n,
+            // Pattern: colored/Shading は 0 成分（パターン名のみ）、uncolored は base の成分数。
+            ColorSpace::Pattern { base } => base.as_ref().map(|b| b.n_components()).unwrap_or(0),
             ColorSpace::Unsupported => 1,
         }
     }
@@ -423,6 +447,10 @@ impl ColorSpace {
                 vec![(0.0, max)]
             }
             ColorSpace::Separation { n, .. } => vec![(0.0, 1.0); *n],
+            ColorSpace::Pattern { base } => match base {
+                Some(b) => b.default_decode(bits_per_component),
+                None => vec![],
+            },
             ColorSpace::Unsupported => vec![(0.0, 1.0)],
         }
     }
@@ -481,6 +509,12 @@ impl ColorSpace {
                 let out = tint.eval(comps);
                 alt.to_rgb(&out)
             }
+            // Pattern: 直接 to_rgb は使われない（パターン描画は別経路）。
+            // uncolored の base 成分があれば base で評価、なければ黒。
+            ColorSpace::Pattern { base } => match base {
+                Some(b) => b.to_rgb(comps),
+                None => [0, 0, 0],
+            },
             ColorSpace::Unsupported => [0, 0, 0],
         }
     }
@@ -835,12 +869,24 @@ mod tests {
     // --- Unsupported ---
 
     #[test]
-    fn pattern_is_unsupported() {
+    fn pattern_name_is_colored_pattern() {
         let doc = Document::new();
         let cs = ColorSpace::parse(&doc, &name_obj("Pattern"), &empty_resources());
-        assert!(matches!(cs, ColorSpace::Unsupported));
-        // 黒に縮退する。
+        assert!(matches!(cs, ColorSpace::Pattern { base: None }));
+        // 直接 to_rgb は使われない経路だが、念のため黒に縮退することを確認。
         assert_eq!(cs.to_rgb(&[0.5]), [0, 0, 0]);
+        // colored Tiling / Shading は scn でパターン名だけを受けるため成分数 0。
+        assert_eq!(cs.n_components(), 0);
+    }
+
+    #[test]
+    fn pattern_array_with_base_is_uncolored() {
+        let doc = Document::new();
+        // [/Pattern /DeviceRGB] = uncolored Tiling、scn はベース色 3 成分 + 名前。
+        let cs_arr = arr(vec![name_obj("Pattern"), name_obj("DeviceRGB")]);
+        let cs = ColorSpace::parse(&doc, &cs_arr, &empty_resources());
+        assert!(matches!(cs, ColorSpace::Pattern { base: Some(_) }));
+        assert_eq!(cs.n_components(), 3);
     }
 
     #[test]

@@ -176,7 +176,15 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
       で PyMuPDF から 4 種のフィクスチャを生成し、`extract_text` の一致で検証。
       R6 ハードンドハッシュの終了条件は仕様の文言と Acrobat/mupdf 実装で
       ラウンド番号の indexing が違うため、1-indexed 解釈を採用）
-- [ ] シェーディング（`sh`、axial/radial）・タイリングパターン
+- [x] シェーディング（`sh`、axial/radial）・タイリングパターン（2026-06-19 完了。
+      Type 2 (Axial)・Type 3 (Radial) の評価器を `render/shading.rs` に追加し、
+      `sh` 演算子と `scn /PatternName`（Pattern 色空間）を `render/state.rs` で
+      統合。Tiling (PatternType 1) は BBox を 1:1 でラスタライズして
+      `xstep/ystep` で繰り返しサンプリング、Shading (PatternType 2) は
+      パターン Matrix × CTM の逆写像で点ごとに shade。Type 1 関数ベースと
+      Type 4–7 メッシュは読み飛ばし、uncolored Tiling の色注入は近似のみ。
+      検証: 軸/放射の両端色、scn パターン経由の矩形塗り、タイリング繰り返し、
+      不正な sh 名の no-op、`to_bytes`→`from_bytes` 往復のピクセル一致を確認）
 - [ ] 透明度（ExtGState `CA`/`ca`、ブレンドモード、透明グループ）
 - [ ] CCITTFaxDecode / JBIG2（スキャン文書）。JPXDecode はスコープ外も妥当
 - [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）

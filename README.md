@@ -78,6 +78,8 @@ cargo doc --open                                  # API ドキュメント
   `CIDFontType0C`）を Type 2 チャーストリング解釈器で描画できる
 - 縦書き（Identity-V）は未対応
 - レンダリングは progressive JPEG / JPX / CCITT / JBIG2 の画像、
-  シェーディング、透明グループが未対応（読み飛ばして描画継続）
+  メッシュ系シェーディング (Type 1/4–7)、透明グループが未対応
+  （読み飛ばして描画継続）。Axial/Radial シェーディング (Type 2/3) と
+  Tiling/Shading パターンは対応
 
 詳細は [doc/REFERENCE.md の §5](doc/REFERENCE.md#5-対応機能と制限事項) を参照。
