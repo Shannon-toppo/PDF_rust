@@ -26,8 +26,13 @@ use std::sync::Arc;
 
 use super::colorspace::ColorSpace;
 use super::path::{Matrix, Path};
+use super::pattern::{self, Pattern};
 use super::pixmap::Pixmap;
-use super::raster::{fill_path_aa, stroke_to_path, FillRule, LineCap, LineJoin, Mask, StrokeStyle};
+use super::raster::{
+    fill_path_aa, fill_path_with_shader, stroke_to_path, FillRule, LineCap, LineJoin, Mask,
+    StrokeStyle,
+};
+use super::shading::Shading;
 use super::text::{build_render_font, FontCache, RenderFont};
 use super::RenderQuality;
 use crate::content::{parse_content, Operation};
@@ -73,6 +78,10 @@ struct GraphicsState {
     stroke_cs: ColorSpace,
     /// 塗り側の不透明度（ExtGState `/ca`。0–255）。画像合成にも使う。
     fill_alpha: u8,
+    /// 塗り側のパターン（Pattern 色空間で `scn` 指定された場合のみ `Some`）。
+    fill_pattern: Option<Rc<Pattern>>,
+    /// 線側のパターン。
+    stroke_pattern: Option<Rc<Pattern>>,
     /// 現在のクリップマスク。`None` はクリップなし。
     clip: Option<Mask>,
 
@@ -111,6 +120,8 @@ impl GraphicsState {
             fill_cs: ColorSpace::DeviceGray,
             stroke_cs: ColorSpace::DeviceGray,
             fill_alpha: 255,
+            fill_pattern: None,
+            stroke_pattern: None,
             clip: None,
             font: None,
             font_size: 0.0,
@@ -475,25 +486,42 @@ impl<'a> Renderer<'a> {
                 let cs = self.resolve_color_space(args, resources);
                 self.gs_mut().fill_cs = cs;
                 self.gs_mut().fill_color = [0, 0, 0];
+                self.gs_mut().fill_pattern = None;
             }
             "CS" => {
                 // CS: 線色空間を設定し、色を既定値（黒）にリセット。
                 let cs = self.resolve_color_space(args, resources);
                 self.gs_mut().stroke_cs = cs;
                 self.gs_mut().stroke_color = [0, 0, 0];
+                self.gs_mut().stroke_pattern = None;
             }
             "sc" | "scn" => {
-                // sc/scn: 保存された色空間で解釈。Unsupported/不明はオペランド数ベースにフォールバック。
+                // sc/scn: 保存された色空間で解釈。Pattern 色空間ならパターン名を解決。
                 let cs = self.gs().fill_cs.clone();
-                let color = color_from_cs(args, &cs);
-                self.gs_mut().fill_color = color;
+                if matches!(cs, ColorSpace::Pattern { .. }) {
+                    let (pat, base_color) = self.resolve_pattern_args(args, &cs, resources);
+                    self.gs_mut().fill_pattern = pat;
+                    self.gs_mut().fill_color = base_color;
+                } else {
+                    let color = color_from_cs(args, &cs);
+                    self.gs_mut().fill_color = color;
+                    self.gs_mut().fill_pattern = None;
+                }
             }
             "SC" | "SCN" => {
                 // SC/SCN: 線色空間版。
                 let cs = self.gs().stroke_cs.clone();
-                let color = color_from_cs(args, &cs);
-                self.gs_mut().stroke_color = color;
+                if matches!(cs, ColorSpace::Pattern { .. }) {
+                    let (pat, base_color) = self.resolve_pattern_args(args, &cs, resources);
+                    self.gs_mut().stroke_pattern = pat;
+                    self.gs_mut().stroke_color = base_color;
+                } else {
+                    let color = color_from_cs(args, &cs);
+                    self.gs_mut().stroke_color = color;
+                    self.gs_mut().stroke_pattern = None;
+                }
             }
+            "sh" => self.op_sh(args, resources),
 
             // --- テキストオブジェクト ---
             "BT" => {
@@ -582,8 +610,8 @@ impl<'a> Renderer<'a> {
             // パスへ流す。
             "BI" => self.do_inline_image(args, resources),
 
-            // --- 無視する演算子（シェーディング・マーク内容など）---
-            // sh・マーク内容・互換は描画に影響しないので何もしない（耐故障性方針）。
+            // --- 無視する演算子（マーク内容・互換など）---
+            // マーク内容・互換は描画に影響しないので何もしない（耐故障性方針）。
             _ => {}
         }
     }
@@ -598,15 +626,19 @@ impl<'a> Renderer<'a> {
         // 塗り（デバイス空間へ変換してから）。
         if do_fill && !self.path.is_empty() {
             let dev = self.path.transform(&gs.ctm);
-            fill_path_aa(
-                self.pm,
-                &dev,
-                fill_rule,
-                gs.fill_color,
-                255,
-                gs.clip.as_ref(),
-                self.subsamples,
-            );
+            if let Some(pat) = gs.fill_pattern.clone() {
+                self.fill_with_pattern(&dev, fill_rule, &pat, &gs);
+            } else {
+                fill_path_aa(
+                    self.pm,
+                    &dev,
+                    fill_rule,
+                    gs.fill_color,
+                    255,
+                    gs.clip.as_ref(),
+                    self.subsamples,
+                );
+            }
         }
 
         // 線（ユーザー空間でアウトライン化 → CTM で変換 → NonZero で塗り）。
@@ -623,15 +655,19 @@ impl<'a> Renderer<'a> {
             let tol = TOLERANCE / scale;
             let outline = stroke_to_path(&self.path, &style, tol);
             let dev = outline.transform(&gs.ctm);
-            fill_path_aa(
-                self.pm,
-                &dev,
-                FillRule::NonZero,
-                gs.stroke_color,
-                255,
-                gs.clip.as_ref(),
-                self.subsamples,
-            );
+            if let Some(pat) = gs.stroke_pattern.clone() {
+                self.fill_with_pattern(&dev, FillRule::NonZero, &pat, &gs);
+            } else {
+                fill_path_aa(
+                    self.pm,
+                    &dev,
+                    FillRule::NonZero,
+                    gs.stroke_color,
+                    255,
+                    gs.clip.as_ref(),
+                    self.subsamples,
+                );
+            }
         }
 
         // 保留クリップの適用（描画演算子の後に現在パスでクリップ）。
@@ -857,6 +893,205 @@ impl<'a> Renderer<'a> {
         // 復元。
         if self.stack.len() > 1 {
             self.stack.pop();
+        }
+    }
+
+    // --- パターン・シェーディング --------------------------------------------
+
+    /// `scn`/`SCN` の Pattern 色空間用にオペランドを解釈する。
+    ///
+    /// 戻り値は (パターン, ベース色)。colored Tiling / Shading パターンは
+    /// ベース色 `[0, 0, 0]` を返す（パターン描画で使われないが安全のため）。
+    /// uncolored Tiling は先頭の `base.n_components()` 個をベース色として
+    /// 解釈する（パターン内部から `scn` を介して参照される想定だが、
+    /// 本実装ではパターン内容のリテラル色をそのまま使うため未使用）。
+    fn resolve_pattern_args(
+        &self,
+        args: &[Object],
+        cs: &ColorSpace,
+        resources: &Dictionary,
+    ) -> (Option<Rc<Pattern>>, [u8; 3]) {
+        // パターン名は末尾。
+        let name = match args.last().and_then(|o| o.as_name().ok()) {
+            Some(n) => n.to_string(),
+            None => return (None, [0, 0, 0]),
+        };
+        // uncolored の場合、先頭から base 成分数だけ色値を読む。
+        let base_color = match cs {
+            ColorSpace::Pattern { base: Some(base) } => {
+                let nums: Vec<f64> = args
+                    .iter()
+                    .take(args.len().saturating_sub(1))
+                    .filter_map(|o| o.as_number().ok())
+                    .collect();
+                let n = base.n_components();
+                let comps: Vec<f64> = (0..n)
+                    .map(|i| nums.get(i).copied().unwrap_or(0.0))
+                    .collect();
+                base.to_rgb(&comps)
+            }
+            _ => [0, 0, 0],
+        };
+        let pat = Pattern::parse(self.doc, &name, resources);
+        if matches!(pat, Pattern::Unsupported) {
+            (None, base_color)
+        } else {
+            (Some(Rc::new(pat)), base_color)
+        }
+    }
+
+    /// `sh` 演算子: 現在クリップを覆う矩形を、シェーディングで塗る。
+    fn op_sh(&mut self, args: &[Object], resources: &Dictionary) {
+        let name = match args.first().and_then(|o| o.as_name().ok()) {
+            Some(n) => n.to_string(),
+            None => return,
+        };
+        // /Resources /Shading から引く。
+        let shadings = match self.doc.dict_get(resources, "Shading") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => return,
+        };
+        let sh_obj = match self.doc.dict_get(&shadings, &name) {
+            Some(o) => o.clone(),
+            None => return,
+        };
+        let shading = Shading::parse(self.doc, &sh_obj, resources);
+
+        // 現在クリップ（無ければ全画面）に対して塗る。
+        let gs = self.gs();
+        let (w, h) = (self.pm.width(), self.pm.height());
+        // 全画面矩形をデバイス空間で構築。
+        let mut full = Path::new();
+        full.move_to(0.0, 0.0);
+        full.line_to(w as f64, 0.0);
+        full.line_to(w as f64, h as f64);
+        full.line_to(0.0, h as f64);
+        full.close();
+
+        // デバイス → シェーディング空間の逆行列（現在 CTM の逆）。
+        let inv_ctm = match gs.ctm.inverse() {
+            Some(m) => m,
+            None => return,
+        };
+        let background = shading.background;
+        let clip = gs.clip.clone();
+        let subsamples = self.subsamples;
+        fill_path_with_shader(
+            self.pm,
+            &full,
+            FillRule::NonZero,
+            255,
+            clip.as_ref(),
+            subsamples,
+            |x, y| {
+                // ピクセル中心をユーザー空間へ。
+                let p = inv_ctm.apply(super::path::Point::new(x as f64 + 0.5, y as f64 + 0.5));
+                match shading.shade_at(p.x, p.y) {
+                    Some(c) => Some(c),
+                    None => background,
+                }
+            },
+        );
+    }
+
+    /// パターンで現在パス（デバイス空間）を塗る。
+    fn fill_with_pattern(
+        &mut self,
+        dev_path: &Path,
+        fill_rule: FillRule,
+        pattern: &Pattern,
+        gs: &GraphicsState,
+    ) {
+        match pattern {
+            Pattern::Shading(sp) => {
+                // pattern → user × user → device = pattern → device。
+                // user → device は現在の CTM（gs.ctm）。
+                let total = sp.matrix.then(&gs.ctm);
+                let inv = match total.inverse() {
+                    Some(m) => m,
+                    None => return,
+                };
+                let shading = &sp.shading;
+                let alpha = gs.fill_alpha;
+                let clip = gs.clip.clone();
+                let subsamples = self.subsamples;
+                fill_path_with_shader(
+                    self.pm,
+                    dev_path,
+                    fill_rule,
+                    alpha,
+                    clip.as_ref(),
+                    subsamples,
+                    |x, y| {
+                        let p = inv.apply(super::path::Point::new(x as f64 + 0.5, y as f64 + 0.5));
+                        shading.shade_at(p.x, p.y)
+                    },
+                );
+            }
+            Pattern::Tiling(t) => {
+                // タイル画像（パターン空間の BBox を 1:1 でラスタライズ）。
+                let tile = match pattern::rasterize_tile(
+                    self.doc,
+                    t,
+                    self.pattern_tile_pixel(&t.matrix.then(&gs.ctm)),
+                ) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let [bx0, by0, bx1, _by1] = t.bbox;
+                let tw = tile.width() as f64;
+                let th = tile.height() as f64;
+                let xstep = t.xstep;
+                let ystep = t.ystep;
+                let total = t.matrix.then(&gs.ctm);
+                let inv = match total.inverse() {
+                    Some(m) => m,
+                    None => return,
+                };
+                let alpha = gs.fill_alpha;
+                let clip = gs.clip.clone();
+                let subsamples = self.subsamples;
+                // タイル化:
+                //   pattern 空間内で (px, py) を [bx0, by0] 起点の周期 (xstep, ystep) で
+                //   折り返し、BBox 範囲外（タイル間ギャップ）は透明扱い。
+                fill_path_with_shader(
+                    self.pm,
+                    dev_path,
+                    fill_rule,
+                    alpha,
+                    clip.as_ref(),
+                    subsamples,
+                    |x, y| {
+                        let p = inv.apply(super::path::Point::new(x as f64 + 0.5, y as f64 + 0.5));
+                        let mut u = (p.x - bx0).rem_euclid(xstep.abs().max(1e-9));
+                        let mut v = (p.y - by0).rem_euclid(ystep.abs().max(1e-9));
+                        if u >= (bx1 - bx0) || v >= (t.bbox[3] - by0) {
+                            return None;
+                        }
+                        // タイル画像の y は左上原点なので反転。
+                        u *= tw / (bx1 - bx0);
+                        v *= th / (t.bbox[3] - by0);
+                        v = th - 1.0 - v;
+                        let xi = (u as u32).min(tile.width().saturating_sub(1));
+                        let yi = (v as u32).min(tile.height().saturating_sub(1));
+                        tile.pixel(xi, yi)
+                    },
+                );
+            }
+            Pattern::Unsupported => {}
+        }
+    }
+
+    /// パターン空間 1 ピクセルあたりの大きさを推定する。
+    ///
+    /// `pattern_to_device` の `approx_scale` の逆数だが、極端に小さい・大きい値は
+    /// 1.0 に丸め込む。
+    fn pattern_tile_pixel(&self, pattern_to_device: &Matrix) -> f64 {
+        let s = pattern_to_device.approx_scale();
+        if !s.is_finite() || s <= 0.0 {
+            1.0
+        } else {
+            (1.0 / s).clamp(0.01, 100.0)
         }
     }
 
@@ -1658,5 +1893,290 @@ mod tests {
         ];
         r.run(&ops, &resources);
         assert_eq!(pm.pixel(10, 10), Some([255, 0, 0]));
+    }
+
+    // --- シェーディング (sh) / パターン ---
+
+    /// 軸方向シェーディング (Axial) を `sh` で描いて、両端の色を確認する。
+    #[test]
+    fn sh_axial_shading() {
+        // Type 2 シェーディング: 黒 (0,0) → 赤 (20,0)。
+        let mut func_dict = crate::object::Dictionary::new();
+        func_dict.set("FunctionType", Object::Integer(2));
+        func_dict.set(
+            "Domain",
+            Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+        );
+        func_dict.set("N", Object::Integer(1));
+        func_dict.set(
+            "C0",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ]),
+        );
+        func_dict.set(
+            "C1",
+            Object::Array(vec![
+                Object::Real(1.0),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ]),
+        );
+        let mut shading_dict = crate::object::Dictionary::new();
+        shading_dict.set("ShadingType", Object::Integer(2));
+        shading_dict.set("ColorSpace", Object::name("DeviceRGB"));
+        shading_dict.set(
+            "Coords",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(20.0),
+                Object::Real(0.0),
+            ]),
+        );
+        shading_dict.set("Function", Object::Dictionary(func_dict));
+
+        let mut shadings = crate::object::Dictionary::new();
+        shadings.set("Sh1", Object::Dictionary(shading_dict));
+        let mut resources = crate::object::Dictionary::new();
+        resources.set("Shading", Object::Dictionary(shadings));
+
+        let doc = Document::new();
+        let mut pm = Pixmap::new(20, 20);
+        let mut r = Renderer::new(&doc, &mut pm, Matrix::identity());
+        // 全画面に sh 適用。
+        r.run(&[op("sh", vec![Object::name("Sh1")])], &resources);
+        // x=0 付近: 黒、x=19 付近: 赤、x=10: 中間。
+        let left = pm.pixel(1, 10).unwrap();
+        let right = pm.pixel(18, 10).unwrap();
+        let mid = pm.pixel(10, 10).unwrap();
+        assert!(left[0] < 40, "左端が黒くない: {:?}", left);
+        assert!(right[0] > 220, "右端が赤くない: {:?}", right);
+        assert!(
+            (60..=200).contains(&mid[0]),
+            "中央が中間色でない: {:?}",
+            mid
+        );
+        assert_eq!(left[1], 0);
+        assert_eq!(right[1], 0);
+    }
+
+    /// 放射方向シェーディング (Radial) を `sh` で描いて、中心と外周の色を確認する。
+    #[test]
+    fn sh_radial_shading() {
+        // Type 3: 中心 (10,10) 半径 0 → 半径 8、黒→白。
+        let mut func_dict = crate::object::Dictionary::new();
+        func_dict.set("FunctionType", Object::Integer(2));
+        func_dict.set(
+            "Domain",
+            Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+        );
+        func_dict.set("N", Object::Integer(1));
+        func_dict.set(
+            "C0",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ]),
+        );
+        func_dict.set(
+            "C1",
+            Object::Array(vec![
+                Object::Real(1.0),
+                Object::Real(1.0),
+                Object::Real(1.0),
+            ]),
+        );
+        let mut shading_dict = crate::object::Dictionary::new();
+        shading_dict.set("ShadingType", Object::Integer(3));
+        shading_dict.set("ColorSpace", Object::name("DeviceRGB"));
+        shading_dict.set(
+            "Coords",
+            Object::Array(vec![
+                Object::Real(10.0),
+                Object::Real(10.0),
+                Object::Real(0.0),
+                Object::Real(10.0),
+                Object::Real(10.0),
+                Object::Real(8.0),
+            ]),
+        );
+        shading_dict.set("Function", Object::Dictionary(func_dict));
+
+        let mut shadings = crate::object::Dictionary::new();
+        shadings.set("Sh1", Object::Dictionary(shading_dict));
+        let mut resources = crate::object::Dictionary::new();
+        resources.set("Shading", Object::Dictionary(shadings));
+
+        let doc = Document::new();
+        let mut pm = Pixmap::new(20, 20);
+        let mut r = Renderer::new(&doc, &mut pm, Matrix::identity());
+        r.run(&[op("sh", vec![Object::name("Sh1")])], &resources);
+        // 中心ほど黒に近い。
+        let center = pm.pixel(10, 10).unwrap();
+        // 中心から半径 5 程度の点。
+        let mid = pm.pixel(14, 10).unwrap();
+        // コーナーはシェーディング範囲外（白のまま、背景指定なし）。
+        let corner = pm.pixel(0, 0).unwrap();
+        assert!(center[0] < 50, "中心が黒でない: {:?}", center);
+        assert!(
+            mid[0] > center[0],
+            "外側ほど明るくならない: {:?} <= {:?}",
+            mid,
+            center
+        );
+        assert!(corner[0] > 240, "範囲外が白でない: {:?}", corner);
+    }
+
+    /// シェーディングパターンを scn で塗りに設定して矩形を塗る。
+    #[test]
+    fn scn_shading_pattern_fills_rect() {
+        // Type 2 (Axial): 黒 (0,0) → 緑 (20,0)。
+        let mut func_dict = crate::object::Dictionary::new();
+        func_dict.set("FunctionType", Object::Integer(2));
+        func_dict.set(
+            "Domain",
+            Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+        );
+        func_dict.set("N", Object::Integer(1));
+        func_dict.set(
+            "C0",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ]),
+        );
+        func_dict.set(
+            "C1",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(1.0),
+                Object::Real(0.0),
+            ]),
+        );
+        let mut shading_dict = crate::object::Dictionary::new();
+        shading_dict.set("ShadingType", Object::Integer(2));
+        shading_dict.set("ColorSpace", Object::name("DeviceRGB"));
+        shading_dict.set(
+            "Coords",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(20.0),
+                Object::Real(0.0),
+            ]),
+        );
+        shading_dict.set("Function", Object::Dictionary(func_dict));
+
+        // PatternType 2（シェーディングパターン）。
+        let mut pattern_dict = crate::object::Dictionary::new();
+        pattern_dict.set("PatternType", Object::Integer(2));
+        pattern_dict.set("Shading", Object::Dictionary(shading_dict));
+
+        let mut patterns = crate::object::Dictionary::new();
+        patterns.set("P1", Object::Dictionary(pattern_dict));
+        let mut resources = crate::object::Dictionary::new();
+        resources.set("Pattern", Object::Dictionary(patterns));
+
+        let doc = Document::new();
+        let mut pm = Pixmap::new(20, 20);
+        let mut r = Renderer::new(&doc, &mut pm, Matrix::identity());
+        let ops = vec![
+            op("cs", vec![Object::name("Pattern")]),
+            op("scn", vec![Object::name("P1")]),
+            op("re", vec![0.into(), 0.into(), 20.into(), 20.into()]),
+            op("f", vec![]),
+        ];
+        r.run(&ops, &resources);
+        // 右半分は緑、左半分は黒に近い。
+        let left = pm.pixel(1, 10).unwrap();
+        let right = pm.pixel(18, 10).unwrap();
+        assert!(left[1] < 40, "左端が黒くない: {:?}", left);
+        assert!(right[1] > 220, "右端が緑でない: {:?}", right);
+        assert_eq!(left[0], 0);
+        assert_eq!(right[0], 0);
+    }
+
+    /// タイリングパターンを scn で設定して矩形を塗る。
+    ///
+    /// タイル 1 枚 = 10x10 のうち左下 5x5 が赤、それ以外は白（透明）。
+    /// XStep/YStep = 10 で繰り返し、20x20 のキャンバスにタイルが 4 つ並ぶ。
+    #[test]
+    fn scn_tiling_pattern_repeats() {
+        // タイル中身: 0 0 5 5 re / 1 0 0 rg / f
+        use crate::content::write_content;
+        let tile_ops = vec![
+            op("re", vec![0.into(), 0.into(), 5.into(), 5.into()]),
+            op("rg", vec![1.0.into(), 0.0.into(), 0.0.into()]),
+            op("f", vec![]),
+        ];
+        let tile_bytes = write_content(&tile_ops);
+
+        let mut pattern_dict = crate::object::Dictionary::new();
+        pattern_dict.set("PatternType", Object::Integer(1));
+        pattern_dict.set("PaintType", Object::Integer(1));
+        pattern_dict.set("TilingType", Object::Integer(1));
+        pattern_dict.set(
+            "BBox",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(10.0),
+                Object::Real(10.0),
+            ]),
+        );
+        pattern_dict.set("XStep", Object::Real(10.0));
+        pattern_dict.set("YStep", Object::Real(10.0));
+        pattern_dict.set(
+            "Resources",
+            Object::Dictionary(crate::object::Dictionary::new()),
+        );
+        let tile_stream = crate::object::Stream::new(pattern_dict, tile_bytes);
+
+        let mut patterns = crate::object::Dictionary::new();
+        patterns.set("P1", Object::Stream(tile_stream));
+        let mut resources = crate::object::Dictionary::new();
+        resources.set("Pattern", Object::Dictionary(patterns));
+
+        let doc = Document::new();
+        let mut pm = Pixmap::new(20, 20);
+        let mut r = Renderer::new(&doc, &mut pm, Matrix::identity());
+        let ops = vec![
+            op("cs", vec![Object::name("Pattern")]),
+            op("scn", vec![Object::name("P1")]),
+            op("re", vec![0.into(), 0.into(), 20.into(), 20.into()]),
+            op("f", vec![]),
+        ];
+        r.run(&ops, &resources);
+        // base_ctm は恒等行列のため、デバイス y はそのままパターン y。
+        // タイル(0,0): パターン (0,0)-(5,5) が赤、(5..10, *) と (*, 5..10) は白。
+        // タイル(1,1): パターン (10..20, 10..20) のうち (10..15, 10..15) が赤。
+        let in_tile00 = pm.pixel(2, 2).unwrap();
+        assert_eq!(in_tile00, [255, 0, 0], "タイル(0,0)赤領域: {:?}", in_tile00);
+        let in_tile11 = pm.pixel(12, 12).unwrap();
+        assert_eq!(in_tile11, [255, 0, 0], "タイル(1,1)赤領域: {:?}", in_tile11);
+        // 同じタイル内のギャップ（x mod 10 が 5–10）は白のまま。
+        let gap_x = pm.pixel(7, 2).unwrap();
+        assert_eq!(gap_x, [255, 255, 255], "タイル赤の右側: {:?}", gap_x);
+        // 同じタイル内のギャップ（y mod 10 が 5–10）も白。
+        let gap_y = pm.pixel(2, 7).unwrap();
+        assert_eq!(gap_y, [255, 255, 255], "タイル赤の上側: {:?}", gap_y);
+    }
+
+    /// 不正な sh は描画に影響しない（panic も色変化もない）。
+    #[test]
+    fn sh_unknown_name_is_noop() {
+        let doc = Document::new();
+        let mut pm = Pixmap::new(10, 10);
+        let mut r = Renderer::new(&doc, &mut pm, Matrix::identity());
+        r.run(
+            &[op("sh", vec![Object::name("NotFound")])],
+            &crate::object::Dictionary::new(),
+        );
+        assert_eq!(pm.pixel(5, 5), Some([255, 255, 255]));
     }
 }

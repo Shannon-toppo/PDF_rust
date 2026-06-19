@@ -483,10 +483,17 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
 - ❌ 縦書き（Identity-V）— 横書き（Identity-H）のみ対応
 - ❌ 画像: progressive JPEG / JPXDecode / CCITTFaxDecode / JBIG2Decode は
   デコード不可（レンダリングでは読み飛ばし。生データ取得は可能）
-- ❌ レンダリング: `/Mask`（ステンシル・カラーキー）、シェーディング（`sh`）、
-  透明グループ・ブレンドモード、Type3 フォント、画像境界のアンチエイリアス
+- ✅ シェーディング（`sh`）— Axial (Type 2) / Radial (Type 3)。
+  `/Background` `/BBox` `/Extend` `/Domain` 対応。Type 1（関数ベース）と
+  Type 4–7（メッシュ）は未対応で読み飛ばし
+- ✅ パターン — Tiling (PatternType 1)・Shading (PatternType 2)。
+  `cs /Pattern` / `scn name` で塗り・線に設定可能。タイリングは BBox を
+  1:1 でラスタライズしてサンプリング（タイル間ギャップは透明扱い）。
+  uncolored Tiling は内部色をそのまま使う近似（仕様完全準拠ではない）
 - ⚠️ CFF（`.otf` / FontFile3 の OpenType・Type1C・CIDFontType0C）は
   自前の Type 2 解釈器で描画可能。Type1（旧式 eexec）はシステムフォント代替の近似
+- ❌ レンダリング: `/Mask`（ステンシル・カラーキー）、透明グループ・
+  ブレンドモード、Type3 フォント、画像境界のアンチエイリアス
 - ❌ 増分更新での保存（電子署名は保存すると無効になる）
 - ❌ レイアウト解析 — テキスト抽出は読み上げ順のヒューリスティック
 - ❌ ToUnicode の無い CID フォント、`/Differences` エンコーディングは近似
