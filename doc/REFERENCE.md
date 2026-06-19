@@ -400,7 +400,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `filters::dct` | baseline JPEG（DCTDecode）デコーダ。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
 | `function` | PDF 関数（§7.10）インタプリタ。Type 0（サンプル）/ 2（指数）/ 3（継ぎ接ぎ）/ 4（PostScript 電卓） |
 | `encoding` | 単純フォントのエンコーディング解決（Standard/MacRoman/`/Differences`/グリフ名） |
-| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ）/ `state`（演算解釈 + 注釈外観 `/AP` の描画）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画）。`RenderOptions` で領域（タイル）レンダリング（基底 CTM へ `translate(-x,-y)` 合成）・協調キャンセル（`AtomicBool`、演算ループ/グリフ/画像行単位で確認）・品質切替を制御 |
+| `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力。通常出力は不透明、透明グループ用に `new_transparent` でアルファ可変バッファも作れる）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ。ブレンドモード対応の `_blended` 変種あり）/ `state`（演算解釈 + 注釈外観 `/AP` の描画。透明グループ Form は `offscreens` スタックに同サイズの透明 Pixmap を積んで内容を蓄積し、離脱時に親へ `composite_from` で合成）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画）/ `shading`（Axial/Radial）/ `pattern`（Tiling/Shading パターン）/ `blend`（ブレンドモード 16 種 + 非分離可能の Hue/Sat/Lum 用 SetLum・SetSat・clip_color）。`RenderOptions` で領域（タイル）レンダリング（基底 CTM へ `translate(-x,-y)` 合成）・協調キャンセル（`AtomicBool`、演算ループ/グリフ/画像行単位で確認）・品質切替を制御 |
 
 ### 4.2 設計上の選択
 
@@ -462,6 +462,12 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
 - ✅ 画像描画: 画像 XObject とインライン画像（BI）。BitsPerComponent 1/2/4/8/16、
   `/Decode`、ImageMask（ステンシル）、SMask（アルファ）、baseline JPEG（DCTDecode）、
   ExtGState `/ca`、回転・せん断 CTM（双線形/最近傍サンプリング）
+- ✅ 透明度（§11）— ExtGState の `/ca`（塗り）・`/CA`（線）・`/BM`
+  （ブレンドモード）と、Form XObject の透明グループ（`/Group <</S /Transparency>>`）。
+  ブレンドモードは分離可能 12 種（Normal/Multiply/Screen/Overlay/Darken/Lighten/
+  ColorDodge/ColorBurn/HardLight/SoftLight/Difference/Exclusion）と非分離可能
+  4 種（Hue/Saturation/Color/Luminosity）。透明グループはオフスクリーン RGBA
+  Pixmap に内部内容を蓄積してから親へ §11.3.4 の合成式で 1 単位として合成する
 - ✅ 色空間: DeviceGray/RGB/CMYK、Indexed、ICCBased（/N・/Alternate 近似）、
   Separation/DeviceN（tint 変換 = PDF 関数 Type 0/2/3/4 インタプリタ）、
   CalGray/CalRGB（Device 同一視）、Lab（近似変換）
@@ -492,8 +498,10 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
   uncolored Tiling は内部色をそのまま使う近似（仕様完全準拠ではない）
 - ⚠️ CFF（`.otf` / FontFile3 の OpenType・Type1C・CIDFontType0C）は
   自前の Type 2 解釈器で描画可能。Type1（旧式 eexec）はシステムフォント代替の近似
-- ❌ レンダリング: `/Mask`（ステンシル・カラーキー）、透明グループ・
-  ブレンドモード、Type3 フォント、画像境界のアンチエイリアス
+- ❌ レンダリング: `/Mask`（ステンシル・カラーキー）、Type3 フォント、
+  画像境界のアンチエイリアス、透明グループの `/I`（isolated）/`/K`（knockout）
+  詳細フラグ（実装は isolated 相当のみ）、ExtGState 経由の `/SMask`
+  （ソフトマスク：画像 XObject 由来のものは対応、ExtGState グループマスクは無視）
 - ❌ 増分更新での保存（電子署名は保存すると無効になる）
 - ❌ レイアウト解析 — テキスト抽出は読み上げ順のヒューリスティック
 - ❌ ToUnicode の無い CID フォント、`/Differences` エンコーディングは近似

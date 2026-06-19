@@ -34,6 +34,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::blend::BlendMode;
 use super::path::Matrix;
 use super::pixmap::Pixmap;
 use super::raster::Mask;
@@ -595,6 +596,7 @@ pub(crate) fn draw_image(
     fill: [u8; 3],
     bilinear_allowed: bool,
     cancel: Option<&AtomicBool>,
+    blend_mode: BlendMode,
 ) {
     if alpha == 0 || img.width == 0 || img.height == 0 {
         return;
@@ -668,7 +670,7 @@ pub(crate) fn draw_image(
                 a = (a * cov + 127) / 255;
             }
             if a > 0 {
-                pm.blend_pixel(px as u32, py as u32, rgb, a.min(255) as u8);
+                pm.blend_pixel_with(px as u32, py as u32, rgb, a.min(255) as u8, blend_mode);
             }
         }
     }

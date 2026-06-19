@@ -72,9 +72,11 @@
 //!   JPX/CCITTFax/JBIG2 と progressive JPEG は未対応（生データの取得は可能）
 //! - レンダリングは画像 XObject・インライン画像（BitsPerComponent 1/2/4/8/16、
 //!   /Decode、ImageMask、SMask、各種色空間、baseline JPEG）と注釈の外観
-//!   ストリーム（/AP /N）を描画する。/Mask（ステンシル・カラーキー）・
-//!   シェーディング・透明度（ブレンドモード・透明グループ）は未対応。
-//!   CFF/Type1 のテキストはシステムフォント代替で近似描画する
+//!   ストリーム（/AP /N）、シェーディング（axial/radial）・タイリングパターン、
+//!   透明度（ExtGState `/ca`・`/CA`、ブレンドモード、Form XObject の
+//!   透明グループ）を描画する。/Mask（ステンシル・カラーキー）と
+//!   /SMask（ソフトマスク）はサポート外（無視）。CFF/Type1 のテキストは
+//!   システムフォント代替で近似描画する
 
 pub mod cff;
 pub mod content;
@@ -107,7 +109,7 @@ pub use error::{PdfError, Result};
 pub use font::StandardFont;
 pub use interactive::{Destination, Link, LinkTarget, OutlineItem};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
-pub use render::{Pixmap, RenderOptions, RenderQuality};
+pub use render::{BlendMode, Pixmap, RenderOptions, RenderQuality};
 pub use search::{SearchHit, SearchOptions};
 pub use text::{SpanGlyph, TextSpan};
 pub use truetype::TrueTypeFont;
