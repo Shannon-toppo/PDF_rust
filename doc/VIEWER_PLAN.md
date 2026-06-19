@@ -211,6 +211,26 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
       仕様が極めて大きく（MQ コーダ・generic / text / halftone region・
       symbol dictionary）、本プロジェクトの「依存ゼロ + フルスクラッチ」
       方針では別 Phase に切り出すのが妥当としてここではスコープ外
+- [ ] JBIG2Decode（スキャン文書、`/Filter /JBIG2Decode`）— ITU-T T.88 /
+      ISO 14492。進行中（`src/filters/jbig2/`）。
+      - セッション 1（2026-06-20、完了）: 基盤
+        （`bitmap`/`reader`/`mq`/`huffman`/`segment`/`page`/`mod`）。
+        セグメントヘッダのパース + ページ情報セグメント + MQ 算術復号器
+        （T.88 Annex E）+ Huffman 復号エンジン（標準テーブル B.1 のみ）+
+        `/JBIG2Globals` の resolver 経由解決。最小ストリーム（ページ情報だけ）
+        を背景一様画像として返す
+      - セッション 2（2026-06-20、完了）: Generic region
+        （`generic_region.rs`）。MMR (T.6) 経路は `ccitt::decode` を流用、
+        算術経路は GBTEMPLATE 0/1/2/3（コンテキスト 16/13/10/10 ビット）+
+        AT pixels（template=0 で 4 ペア、それ以外で 1 ペア）+ TPGDON
+        （SLTP_CX による行スキップ）を実装。Driver は immediate generic
+        region をパースして領域結合演算子（OR/AND/XOR/XNOR/REPLACE）で
+        ページに合成する。検証: ユニット 11 増（generic_region 9 +
+        mod 2: MMR 経路完走・算術経路完走の往復）
+      - セッション 3（未着手）: Symbol dictionary / Text region /
+        Generic refinement / Huffman B.2–B.15
+      - セッション 4（未着手）: Pattern dictionary / Halftone region と
+        全ドキュメント同期
 - [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
 - [ ] `/Mask`（ステンシル・カラーキー）
 - [ ] 縦書き（Identity-V。和文ビューワーとしては将来必要）
