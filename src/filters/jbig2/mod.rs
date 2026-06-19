@@ -14,27 +14,31 @@
 //! **PDF 慣習に従い 1 = 白、0 = 黒**（DeviceGray の既定 `/Decode = [0 1]` と整合）。
 //! JBIG2 内部の「1 = 前景（黒）」とは反転している。反転は本モジュールの最終段で行う。
 //!
-//! ## サポート状況（セッション 1）
+//! ## サポート状況（セッション 2 まで）
 //!
 //! - セグメントヘッダのパース／ページ情報セグメントの処理：完備
-//! - Generic region（算術 + MMR）: セッション 2
+//! - Generic region（算術 + MMR）: 完備
+//!   ([`generic_region`])。GBTEMPLATE 0/1/2/3 + AT pixels + TPGDON、
+//!   MMR は [`ccitt::decode`][crate::filters::ccitt::decode] を流用
 //! - Symbol dictionary / Text region / Generic refinement: セッション 3
 //! - Pattern dictionary / Halftone region: セッション 4
 //!
-//! 未対応セグメント種別は黙って読み飛ばす（耐故障路）。これにより、現段階でも
-//! 「ページ情報セグメントだけがある最小 JBIG2」は背景一様画像として出力される。
+//! 未対応セグメント種別は黙って読み飛ばす（耐故障路）。Intermediate generic
+//! region はセッション 3 の symbol dictionary 連携用なので、現段階では
+//! デコードだけ試みて結果を捨てる。
 
 use crate::error::{PdfError, Result};
 use crate::object::{Dictionary, Object};
 
 pub mod bitmap;
+pub mod generic_region;
 pub mod huffman;
 pub mod mq;
 pub mod page;
 pub mod reader;
 pub mod segment;
 
-use bitmap::Bitmap;
+use bitmap::{Bitmap, CombineOp};
 use page::PageInfo;
 use reader::ByteReader;
 use segment::{SegmentHeader, SegmentType};
@@ -172,11 +176,16 @@ impl Driver {
                     self.current_stripe_y = y.saturating_add(1);
                 }
             }
-            // 以下はセッション 2/3/4 で実装。現段階は読み飛ばす（耐故障）。
-            SegmentType::ImmediateGenericRegion
-            | SegmentType::ImmediateLosslessGenericRegion
-            | SegmentType::IntermediateGenericRegion => {
-                // セッション 2 で実装
+            // Generic region: 算術 MQ 経路 + MMR 経路。Intermediate は中間
+            // ビットマップとしては保持しないが（Symbol/Refinement 連携の作業は
+            // セッション 3）、即時版と同様にデコードしてもページに合成しない。
+            SegmentType::ImmediateGenericRegion | SegmentType::ImmediateLosslessGenericRegion => {
+                self.dispatch_generic_region(data, /*immediate=*/ true)?;
+            }
+            SegmentType::IntermediateGenericRegion => {
+                // セッション 3 の symbol dictionary 連携で中間結果を使うが、
+                // 現段階ではデコードだけ試みて捨てる（耐故障）。
+                let _ = self.dispatch_generic_region(data, /*immediate=*/ false);
             }
             SegmentType::SymbolDictionary
             | SegmentType::IntermediateTextRegion
@@ -199,6 +208,43 @@ impl Driver {
             SegmentType::Profiles | SegmentType::Extension | SegmentType::Unknown(_) => {
                 // 仕様で「未知セグメントは無視可」とされている
             }
+        }
+        Ok(())
+    }
+
+    /// Generic region セグメントのデータ部を復号してページへ合成する。
+    ///
+    /// `immediate=true` のときはページビットマップに `external_combop` で
+    /// 合成し、`immediate=false` のときはデコードだけ行って結果を捨てる
+    /// （セッション 3 で中間ビットマップ保管に置き換える）。
+    fn dispatch_generic_region(&mut self, data: &[u8], immediate: bool) -> Result<()> {
+        let (params, payload) = generic_region::parse_header(data)?;
+        let bm = generic_region::decode_region(&params, payload)?;
+        if !immediate {
+            return Ok(());
+        }
+        // ページに合成する: 外部 COMBOP (region.external_combop) を使う
+        // ただし PageInfo の combop_override / default_combop の影響は仕様 §7.4.1
+        // 参照。簡略のため、ページが confirmed の最初の領域は REPLACE 扱いに
+        // 強制する流派（jbig2dec）も多いが、ここでは仕様に従い external_combop。
+        let op = if let Some(pi) = &self.page_info {
+            if pi.combop_override {
+                generic_region::combine_op_from(pi.default_combop)
+            } else {
+                generic_region::combine_op_from(params.region.external_combop)
+            }
+        } else {
+            CombineOp::Or
+        };
+        let x = params.region.x as i64;
+        let y = params.region.y as i64;
+        if let Some(page) = self.page.as_mut() {
+            page.combine(&bm, x, y, op);
+        }
+        // 高さ不定のページが progress した行数を更新（次の end-of-stripe で利用）
+        let new_y = (params.region.y as u64).saturating_add(params.region.height as u64);
+        if new_y > self.current_stripe_y as u64 {
+            self.current_stripe_y = new_y.min(u32::MAX as u64) as u32;
         }
         Ok(())
     }
@@ -275,6 +321,79 @@ mod tests {
         s.push(1);
         s.extend_from_slice(&0u32.to_be_bytes());
         assert!(decode(&s, None, None).is_err());
+    }
+
+    /// ページ情報セグメントだけのストリームに、フル白の generic region（MMR
+    /// 経路、空ペイロード → 0 行）を結合しても decode は完走する。
+    /// MMR 経路がパース→ccitt 呼び出し→ページ無変更まで通ることを確認。
+    #[test]
+    fn generic_region_mmr_empty_combines() {
+        let s = build_min_stream(8, 2, 0);
+        // ---- generic region セグメント（type=38, immediate） ----
+        let mut seg = Vec::new();
+        // ヘッダ
+        seg.extend_from_slice(&3u32.to_be_bytes()); // number
+        seg.push(38); // immediate generic region
+        seg.push(0); // ref count=0
+        seg.push(1); // page assoc
+                     // データ部 = 領域情報 17B + flags 1B + 空 MMR ペイロード
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&8u32.to_be_bytes()); // width
+        payload.extend_from_slice(&0u32.to_be_bytes()); // height=0
+        payload.extend_from_slice(&0u32.to_be_bytes()); // x
+        payload.extend_from_slice(&0u32.to_be_bytes()); // y
+        payload.push(0); // combop=0 (OR)
+        payload.push(0x01); // flags: MMR=1
+        seg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        seg.extend_from_slice(&payload);
+
+        // 順序: [PageInfo, EndOfPage, GenericRegion] になるので
+        // end-of-page の前に挿入する
+        // build_min_stream は末尾が end-of-page なので、その前に挿入し直す。
+        let mut s2 = Vec::new();
+        // end-of-page セグメントは 11 バイト（ヘッダのみ・データ長 0）
+        s2.extend_from_slice(&s[..s.len() - 11]); // page info セグメント全体
+        s2.extend_from_slice(&seg);
+        s2.extend_from_slice(&s[s.len() - 11..]); // end-of-page
+
+        let out = decode(&s2, None, None).unwrap();
+        assert_eq!(out.len(), 2);
+        // ページは無変更（背景白）= 0xFF
+        assert!(out.iter().all(|b| *b == 0xFF));
+    }
+
+    /// 算術 generic region（テンプレ 0 / TPGDON 無し / 全ゼロペイロード）が
+    /// パース→MQ 復号→ページ合成の流れで panic せず完走する。
+    /// 出力値は実装依存だが、サイズと終了は確実に検証する。
+    #[test]
+    fn generic_region_arith_runs() {
+        // 16x4 のページに同サイズ generic region（COMBOP=REPLACE）を載せる
+        let s = build_min_stream(16, 4, 0);
+        let mut seg = Vec::new();
+        seg.extend_from_slice(&3u32.to_be_bytes());
+        seg.push(38);
+        seg.push(0);
+        seg.push(1);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&16u32.to_be_bytes()); // width
+        payload.extend_from_slice(&4u32.to_be_bytes()); // height
+        payload.extend_from_slice(&0u32.to_be_bytes()); // x
+        payload.extend_from_slice(&0u32.to_be_bytes()); // y
+        payload.push(4); // region info flags: combop=4 (REPLACE), color=0
+        payload.push(0x00); // generic region flags: MMR=0, template=0, tpgdon=0
+        payload.extend_from_slice(&[3, 0xFF, 0xFD, 0xFF, 2, 0xFE, 0xFE, 0xFE]); // AT (default)
+        payload.extend_from_slice(&[0u8; 16]); // 全 0 のペイロード
+        payload.extend_from_slice(&[0xFF, 0xAC]); // 擬似ターミネータ
+        seg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        seg.extend_from_slice(&payload);
+        let mut s2 = Vec::new();
+        s2.extend_from_slice(&s[..s.len() - 11]);
+        s2.extend_from_slice(&seg);
+        s2.extend_from_slice(&s[s.len() - 11..]);
+
+        let out = decode(&s2, None, None).unwrap();
+        // stride=2、4 行 → 8 バイト
+        assert_eq!(out.len(), 8);
     }
 
     #[test]
