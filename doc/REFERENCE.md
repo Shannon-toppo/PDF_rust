@@ -397,7 +397,7 @@ PDF は追記による更新（incremental update）が可能で、その場合 
 | `cff` | CFF（Compact Font Format）パーサと Type 2 チャーストリング解釈器。CFF / OpenType-CFF / `/FontFile3`（OpenType・Type1C・CIDFontType0C）対応 |
 | `subset` | TrueType サブセッタ。グリフ閉包（composite 対応）、sparse glyf、チェックサム再計算 |
 | `writer` | シリアライザ。実数の正規化、文字列/名前のエスケープ、xref 生成、`/ID` 生成（FNV-1a） |
-| `filters::dct` | baseline JPEG（DCTDecode）デコーダ。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
+| `filters::dct` | JPEG（DCTDecode）デコーダ。baseline / extended-sequential / progressive。ハフマン復号 + 浮動小数 IDCT + 双線形クロマアップサンプリング、YCbCr/YCCK 色変換 |
 | `function` | PDF 関数（§7.10）インタプリタ。Type 0（サンプル）/ 2（指数）/ 3（継ぎ接ぎ）/ 4（PostScript 電卓） |
 | `encoding` | 単純フォントのエンコーディング解決（Standard/MacRoman/`/Differences`/グリフ名） |
 | `render` | ラスタライザ。`pixmap`（RGBA + PNG 出力。通常出力は不透明、透明グループ用に `new_transparent` でアルファ可変バッファも作れる）/ `path`（行列・ベジェ平坦化）/ `raster`（AA スキャンライン塗り・ストローク・クリップ。ブレンドモード対応の `_blended` 変種あり）/ `state`（演算解釈 + 注釈外観 `/AP` の描画。透明グループ Form は `offscreens` スタックに同サイズの透明 Pixmap を積んで内容を蓄積し、離脱時に親へ `composite_from` で合成）/ `text`（描画用フォント解決）/ `colorspace`（色空間 → sRGB）/ `image`（画像 XObject・インライン画像の描画）/ `shading`（Axial/Radial）/ `pattern`（Tiling/Shading パターン）/ `blend`（ブレンドモード 16 種 + 非分離可能の Hue/Sat/Lum 用 SetLum・SetSat・clip_color）。`RenderOptions` で領域（タイル）レンダリング（基底 CTM へ `translate(-x,-y)` 合成）・協調キャンセル（`AtomicBool`、演算ループ/グリフ/画像行単位で確認）・品質切替を制御 |
@@ -460,7 +460,7 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
   キャンセル（`PdfError::Cancelled`）、出力バッファ再利用、注釈の ON/OFF、
   高速品質モード（AA 1x + 最近傍補間）、`page_size`（/Rotate 反映済み pt サイズ）
 - ✅ 画像描画: 画像 XObject とインライン画像（BI）。BitsPerComponent 1/2/4/8/16、
-  `/Decode`、ImageMask（ステンシル）、SMask（アルファ）、baseline JPEG（DCTDecode）、
+  `/Decode`、ImageMask（ステンシル）、SMask（アルファ）、JPEG（DCTDecode。baseline / progressive）、
   ExtGState `/ca`、回転・せん断 CTM（双線形/最近傍サンプリング）
 - ✅ 透明度（§11）— ExtGState の `/ca`（塗り）・`/CA`（線）・`/BM`
   （ブレンドモード）と、Form XObject の透明グループ（`/Group <</S /Transparency>>`）。
@@ -487,7 +487,8 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
   と非標準 `/Filter` ハンドラは未対応
 - ❌ CFF アウトライン（`.otf`）— `load_font_from_bytes` が `PdfError::Font` を返す
 - ❌ 縦書き（Identity-V）— 横書き（Identity-H）のみ対応
-- ❌ 画像: progressive JPEG / JPXDecode はデコード不可
+- ✅ 画像: JPEG（DCTDecode。baseline / extended-sequential / progressive）をデコード対応
+- ❌ 画像: JPXDecode（JPEG2000）はデコード不可
   （レンダリングでは読み飛ばし。生データ取得は可能）
 - ✅ CCITTFaxDecode（T.4 1D / T.4 2D / T.6 MMR）—
   `/K` `Columns` `Rows` `EndOfBlock` `EndOfLine` `EncodedByteAlign`

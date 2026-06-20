@@ -35,7 +35,7 @@ doc.save("output.pdf")?;
 - **編集**: テキスト・図形の描画、ページ追加/削除/回転、メタデータ編集
 - **日本語描画**: TrueType/TTC フォント埋め込み・自動サブセット化・Identity-H（`add_text_with_font`）
 - **レンダリング**: ページを PNG にラスタライズ（`render_page`）。ベクタ図形・
-  TrueType テキスト・画像（baseline JPEG / FlateDecode 等）・各種色空間・
+  TrueType テキスト・画像（JPEG（baseline / progressive）/ FlateDecode 等）・各種色空間・
   注釈の外観ストリーム（/AP）に対応。`render_page_with`（`RenderOptions`）で
   領域（タイル）レンダリング・協調キャンセル・バッファ再利用・品質切替も可能
 - **読み込み対応形式**: 古典 xref / クロスリファレンスストリーム /
@@ -44,7 +44,7 @@ doc.save("output.pdf")?;
   V5 R6（AES-256）の復号に対応（`Document::from_bytes` は空ユーザーパスワード
   を自動試行、`from_bytes_with_password` で任意 PW 指定可能）。再保存は平文化
 - **フィルタ**: FlateDecode（PNG/TIFF predictor 込み）, LZW, ASCII85,
-  ASCIIHex, RunLength, baseline JPEG（DCTDecode）— すべて自前実装
+  ASCIIHex, RunLength, JPEG（DCTDecode。baseline / progressive）— すべて自前実装
 - **暗号プリミティブ**: MD5/RC4/AES-128/AES-256/SHA-256/384/512 を自前実装
   （標準セキュリティハンドラ用）
 
@@ -77,7 +77,7 @@ cargo doc --open                                  # API ドキュメント
   OTTO sfnt の `CFF ` テーブルと PDF `/FontFile3`（`OpenType` / `Type1C` /
   `CIDFontType0C`）を Type 2 チャーストリング解釈器で描画できる
 - 縦書き（Identity-V）は未対応
-- レンダリングは progressive JPEG / JPX が未対応、
+- レンダリングは JPX が未対応、
   メッシュ系シェーディング (Type 1/4–7) も未対応
   （読み飛ばして描画継続）。CCITTFaxDecode (T.4 1D/2D・T.6 MMR) と
   JBIG2Decode（Generic / Symbol / Text / Refinement / Pattern / Halftone

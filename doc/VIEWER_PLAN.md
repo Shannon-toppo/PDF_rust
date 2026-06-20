@@ -157,7 +157,7 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
 
 優先順: CFF → 暗号化（空パスワード優先）→ シェーディング → 透明度 → CCITT。
 「手元の実 PDF が表示できない」事例ドリブンで進める。
-現状: CFF・暗号化・シェーディング・透明度・CCITT・JBIG2 まで完了（2026-06-20）。
+現状: CFF・暗号化・シェーディング・透明度・CCITT・JBIG2・progressive JPEG まで完了（2026-06-20）。
 
 - [x] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
       — `src/cff.rs`（CFF パーサ + Type 2 解釈器）と `src/cff_strings.rs`
@@ -256,7 +256,22 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
         HENABLESKIP は未対応エラー（実 PDF の出現が稀）。検証: ユニット
         17 増（pattern_dict 5 + halftone_region 11 + mod 1: pattern→
         halftone セグメント連鎖の `decode` 完走）
-- [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
+- [x] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
+      （2026-06-20 完了）。SOF2 を baseline と同じデコーダ内に統合し、スペクトル
+      選択（Ss/Se）と逐次近似（Ah/Al）の複数スキャンを成分ごとの係数バッファ
+      （自然順 64/ブロック）に蓄積、全スキャン完了後に一括でデクオンタイズ +
+      逆 DCT する（`finalize_progressive`）。DC 初回/精緻化、AC 初回（EOBRUN +
+      ZRL）、AC 精緻化（補正ビット + 新規係数配置）を T.81 Annex G.1.2 どおりに
+      実装。AC 初回の EOBRUN は現在ブロックを除いた後続数（`(1<<r)-1+付加`）、
+      AC 精緻化は現在ブロックを含む数（`(1<<r)+付加`、末尾で 1 減算）という
+      非対称性に注意。インターリーブ DC スキャンと非インターリーブ AC スキャン
+      （成分自身のブロック格子 = ceil(成分サンプル/8)）、リスタートマーカーに対応。
+      12bit・算術符号化は引き続き明示エラー。レンダラは `dct::decode` を呼ぶだけ
+      なので画像 XObject / インライン画像から自然に利用される。検証: dct ユニット
+      5 増（DC 初回/精緻化・AC EOBRUN off-by-one・係数配置・AC 精緻化補正）+
+      統合 7（Pillow で生成した progressive フィクスチャ `prog_*` を 4:4:4/4:2:0・
+      奇数サイズで誤差比較）+ 既存の切り詰め/破壊 fuzz に progressive を追加。
+      フィクスチャ生成は `tests/fixtures/gen_progressive_jpeg_fixtures.py`
 - [ ] `/Mask`（ステンシル・カラーキー）
 - [ ] 縦書き（Identity-V。和文ビューワーとしては将来必要）
 

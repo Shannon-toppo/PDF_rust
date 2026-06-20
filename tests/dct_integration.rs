@@ -109,22 +109,97 @@ fn gradient_32_q50() {
     check_jpeg("gradient_32_q50.jpg", "gradient_32_q50.rgb");
 }
 
-#[test]
-fn sof2_progressive_is_rejected() {
-    // SOF2（progressive）は明示的な Filter エラーで拒否されること。
-    // 最小の SOI + SOF2 マーカーを合成して投げる。
-    let mut data = vec![0xFF, 0xD8]; // SOI
-                                     // SOF2: marker, len(=11), prec=8, h=8, w=8, nc=1, comp(id=1, hv=0x11, tq=0)
-    data.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
-    data.extend_from_slice(&[0x01, 0x11, 0x00]);
-    data.extend_from_slice(&[0xFF, 0xD9]); // EOI
-    match dct::decode(&data) {
-        Ok(_) => panic!("progressive は拒否されるべき"),
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(msg.contains("progressive"), "エラーメッセージ: {msg}");
-        }
+/// progressive JPEG（SOF2）をデコードして RGB 期待値と誤差許容で比較する。
+///
+/// フィクスチャ `tests/fixtures/prog_*.jpg` と期待値 `*.rgb` は Pillow（外部ツール）
+/// で生成済み（生成手順は `tests/fixtures/gen_progressive_jpeg_fixtures.py`）。
+/// baseline と同様、IDCT 実装差で完全一致はしないため誤差を許容する:
+///   - 各ピクセル各チャネルの絶対差 <= 12
+///   - 全体の平均絶対差 <= 2.0
+fn check_progressive(jpg: &str, rgb: &str) {
+    let jpg_path = fixture(jpg);
+    let rgb_path = fixture(rgb);
+    if !jpg_path.exists() || !rgb_path.exists() {
+        eprintln!(
+            "フィクスチャ {jpg} / {rgb} が無いためスキップ（gen_progressive_jpeg_fixtures.py を実行のこと）"
+        );
+        return;
     }
+    let jpg_data = std::fs::read(&jpg_path).unwrap();
+    let expected = std::fs::read(&rgb_path).unwrap();
+
+    let img = dct::decode(&jpg_data).unwrap_or_else(|e| panic!("{jpg} のデコードに失敗: {e}"));
+    assert_eq!(img.components, 3, "{jpg}: RGB 3 成分のはず");
+    assert_eq!(
+        img.data.len(),
+        expected.len(),
+        "{jpg}: ピクセルバイト数が期待値と異なる（{}x{}）",
+        img.width,
+        img.height
+    );
+
+    let mut max_diff = 0i32;
+    let mut sum_diff = 0u64;
+    for (i, (&got, &exp)) in img.data.iter().zip(expected.iter()).enumerate() {
+        let d = (got as i32 - exp as i32).abs();
+        if d > max_diff {
+            max_diff = d;
+        }
+        sum_diff += d as u64;
+        assert!(
+            d <= 12,
+            "{jpg}: バイト {i} の差が大きすぎる (got={got}, exp={exp}, diff={d})"
+        );
+    }
+    let avg = sum_diff as f64 / img.data.len() as f64;
+    assert!(
+        avg <= 2.0,
+        "{jpg}: 平均絶対差が大きすぎる (avg={avg:.3}, max={max_diff})"
+    );
+    eprintln!(
+        "{jpg}: OK ({}x{}, max_diff={max_diff}, avg={avg:.3})",
+        img.width, img.height
+    );
+}
+
+#[test]
+fn prog_solid_16_q90() {
+    check_progressive("prog_solid_16_q90.jpg", "prog_solid_16_q90.rgb");
+}
+
+#[test]
+fn prog_gradient_16_q90() {
+    check_progressive("prog_gradient_16_q90.jpg", "prog_gradient_16_q90.rgb");
+}
+
+#[test]
+fn prog_blocks_16_q90() {
+    check_progressive("prog_blocks_16_q90.jpg", "prog_blocks_16_q90.rgb");
+}
+
+#[test]
+fn prog_blocks_16_q50() {
+    // 低品質 = 4:2:0 サブサンプリング。非インターリーブ AC スキャン + クロマ
+    // アップサンプリングの検証。
+    check_progressive("prog_blocks_16_q50.jpg", "prog_blocks_16_q50.rgb");
+}
+
+#[test]
+fn prog_gradient_17x13_q90() {
+    // 奇数サイズ = 右端・下端の半端 MCU を検証。
+    check_progressive("prog_gradient_17x13_q90.jpg", "prog_gradient_17x13_q90.rgb");
+}
+
+#[test]
+fn prog_blocks_17x13_q50() {
+    // 奇数サイズ + 4:2:0。半端 MCU とサブサンプリングの組み合わせ。
+    check_progressive("prog_blocks_17x13_q50.jpg", "prog_blocks_17x13_q50.rgb");
+}
+
+#[test]
+fn prog_gradient_32_q50() {
+    // 複数 MCU にまたがるグラデーション（4:2:0）。AC スキャンの EOBRUN を検証。
+    check_progressive("prog_gradient_32_q50.jpg", "prog_gradient_32_q50.rgb");
 }
 
 #[test]
@@ -134,6 +209,9 @@ fn truncated_inputs_do_not_panic() {
         "blocks_16_q50.jpg",
         "gradient_17x13_q90.jpg",
         "gradient_32_q50.jpg",
+        "prog_blocks_16_q50.jpg",
+        "prog_gradient_17x13_q90.jpg",
+        "prog_gradient_32_q50.jpg",
     ] {
         let path = fixture(name);
         if !path.exists() {
