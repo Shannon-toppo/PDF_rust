@@ -295,6 +295,26 @@ fn template(t: u8) -> Result<&'static Tmpl> {
     })
 }
 
+/// 外部の `ArithDecoder` と既存コンテキスト配列を使い回す版。Symbol dictionary
+/// 内のジェネリック領域（複数シンボルで MQ 状態を共有）から呼ばれる。
+///
+/// `params.tpgdon` は無視（symbol dictionary 用の generic region は TPGDON
+/// 非対応）。AT pixels と template は params に従う。
+pub fn decode_arith_shared(
+    params: &GenericRegionParams,
+    ad: &mut ArithDecoder,
+    cx: &mut [u8],
+) -> Result<Bitmap> {
+    let tmpl = template(params.template)?;
+    let w = params.region.width;
+    let h = params.region.height;
+    let mut bm = Bitmap::new(w, h);
+    for y in 0..h as i64 {
+        decode_row(&mut bm, y, tmpl, &params.at_pixels, cx, ad);
+    }
+    Ok(bm)
+}
+
 fn decode_arithmetic(params: &GenericRegionParams, payload: &[u8]) -> Result<Bitmap> {
     let tmpl = template(params.template)?;
     let w = params.region.width;

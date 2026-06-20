@@ -227,8 +227,20 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
         region をパースして領域結合演算子（OR/AND/XOR/XNOR/REPLACE）で
         ページに合成する。検証: ユニット 11 増（generic_region 9 +
         mod 2: MMR 経路完走・算術経路完走の往復）
-      - セッション 3（未着手）: Symbol dictionary / Text region /
-        Generic refinement / Huffman B.2–B.15
+      - セッション 3（2026-06-20、完了）: Symbol dictionary
+        （`symbol_dict.rs`）／ Text region（`text_region.rs`）／ Generic
+        refinement（`refinement.rs`）／ Huffman B.2–B.15。SDHUFF=0 の
+        arithmetic 経路（SDTEMPLATE 0–3、SDREFAGG=1 の単一インスタンス
+        refinement 含む）と SBHUFF=0 の text region（refinement・transposed・
+        参照コーナー対応）を実装。Generic refinement は GRTEMPLATE 0/1 +
+        AT pixels（既定 (-1,-1)）+ TPGRON。Huffman は標準テーブル B.1–B.15
+        を pdf.js の Annex B データから移植 + カスタムテーブル（type 53）
+        パーサ。Driver は `BTreeMap<u32, SegmentArtifact>` でシンボル列・
+        中間ビットマップ・カスタムテーブルを保持し、参照番号で解決する。
+        Huffman 経路の symbol/text region は明示的に未対応エラーで返す
+        （実 PDF では arithmetic がほぼ全て）。検証: ユニット 49 増
+        （huffman 7 + refinement 5 + symbol_dict 5 + text_region 4 +
+        mod 3: 空シンボル辞書 / 不正テーブル素通り / 参照無し refinement）
       - セッション 4（未着手）: Pattern dictionary / Halftone region と
         全ドキュメント同期
 - [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）

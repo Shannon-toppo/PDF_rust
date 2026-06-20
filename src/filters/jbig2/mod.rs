@@ -36,12 +36,18 @@ pub mod huffman;
 pub mod mq;
 pub mod page;
 pub mod reader;
+pub mod refinement;
 pub mod segment;
+pub mod symbol_dict;
+pub mod text_region;
 
 use bitmap::{Bitmap, CombineOp};
+use huffman::HuffmanTable;
 use page::PageInfo;
 use reader::ByteReader;
 use segment::{SegmentHeader, SegmentType};
+
+use std::collections::BTreeMap;
 
 pub(crate) fn err(msg: impl Into<String>) -> PdfError {
     PdfError::Filter(msg.into())
@@ -104,12 +110,25 @@ fn extract_globals(
 // セグメント列のドライバ
 // ---------------------------------------------------------------------------
 
+/// 復号済みセグメントの中間成果物。`referred_segments` 経由で参照される。
+enum SegmentArtifact {
+    /// Symbol dictionary が公開したシンボル列
+    Symbols(Vec<Bitmap>),
+    /// Intermediate generic / refinement で得られた中間ビットマップ
+    Bitmap(Bitmap),
+    /// Tables セグメントから組み立てたカスタム Huffman テーブル
+    #[allow(dead_code)]
+    Table(HuffmanTable),
+}
+
 /// セグメントを順次処理する状態機械。
 struct Driver {
     page: Option<Bitmap>,
     page_info: Option<PageInfo>,
     /// EndOfStripe で更新される、現在の塗り上限行（高さ未確定ページ用）。
     current_stripe_y: u32,
+    /// セグメント番号 → 中間成果物。
+    artifacts: BTreeMap<u32, SegmentArtifact>,
 }
 
 impl Driver {
@@ -118,7 +137,31 @@ impl Driver {
             page: None,
             page_info: None,
             current_stripe_y: 0,
+            artifacts: BTreeMap::new(),
         }
+    }
+
+    /// 参照シンボルを連結して 1 つの `Vec<Bitmap>` にまとめる。
+    /// `Symbols` 以外の参照は無視（耐故障）。
+    fn collect_input_symbols(&self, refs: &[u32]) -> Vec<Bitmap> {
+        let mut out = Vec::new();
+        for r in refs {
+            if let Some(SegmentArtifact::Symbols(syms)) = self.artifacts.get(r) {
+                out.extend_from_slice(syms);
+            }
+        }
+        out
+    }
+
+    /// 単一のビットマップ成果物を引き当てる（Refinement 用に最初に見つかった
+    /// Bitmap を返す）。
+    fn first_referenced_bitmap(&self, refs: &[u32]) -> Option<&Bitmap> {
+        for r in refs {
+            if let Some(SegmentArtifact::Bitmap(b)) = self.artifacts.get(r) {
+                return Some(b);
+            }
+        }
+        None
     }
 
     fn process_stream(&mut self, data: &[u8]) -> Result<()> {
@@ -183,18 +226,77 @@ impl Driver {
                 self.dispatch_generic_region(data, /*immediate=*/ true)?;
             }
             SegmentType::IntermediateGenericRegion => {
-                // セッション 3 の symbol dictionary 連携で中間結果を使うが、
-                // 現段階ではデコードだけ試みて捨てる（耐故障）。
-                let _ = self.dispatch_generic_region(data, /*immediate=*/ false);
+                // 中間ビットマップは Refinement の参照や Halftone の素材として
+                // 後段から参照される可能性があるので artifacts に保存する。
+                if let Ok((params, payload)) = generic_region::parse_header(data) {
+                    if let Ok(bm) = generic_region::decode_region(&params, payload) {
+                        self.artifacts
+                            .insert(header.number, SegmentArtifact::Bitmap(bm));
+                    }
+                }
             }
-            SegmentType::SymbolDictionary
-            | SegmentType::IntermediateTextRegion
-            | SegmentType::ImmediateTextRegion
+            SegmentType::SymbolDictionary => {
+                // 参照シンボル辞書を集約してから新規辞書を復号
+                let input_symbols = self.collect_input_symbols(&header.referred_segments);
+                let (params, payload) = symbol_dict::parse_header(data)?;
+                match symbol_dict::decode(&params, payload, &input_symbols) {
+                    Ok(syms) => {
+                        self.artifacts
+                            .insert(header.number, SegmentArtifact::Symbols(syms));
+                    }
+                    Err(_) => {
+                        // 耐故障: 復号失敗時は空シンボル列を登録
+                        self.artifacts
+                            .insert(header.number, SegmentArtifact::Symbols(Vec::new()));
+                    }
+                }
+            }
+            SegmentType::ImmediateTextRegion
             | SegmentType::ImmediateLosslessTextRegion
-            | SegmentType::IntermediateGenericRefinementRegion
-            | SegmentType::ImmediateGenericRefinementRegion
-            | SegmentType::ImmediateLosslessGenericRefinementRegion => {
-                // セッション 3 で実装
+            | SegmentType::IntermediateTextRegion => {
+                let symbols = self.collect_input_symbols(&header.referred_segments);
+                let (params, payload) = text_region::parse_header(data)?;
+                match text_region::decode(&params, payload, &symbols) {
+                    Ok(bm) => {
+                        if matches!(
+                            header.seg_type,
+                            SegmentType::ImmediateTextRegion
+                                | SegmentType::ImmediateLosslessTextRegion
+                        ) {
+                            self.compose_to_page(&bm, &params.region);
+                        } else {
+                            self.artifacts
+                                .insert(header.number, SegmentArtifact::Bitmap(bm));
+                        }
+                    }
+                    Err(_) => {
+                        // 耐故障: ページ更新せずに通過
+                    }
+                }
+            }
+            SegmentType::ImmediateGenericRefinementRegion
+            | SegmentType::ImmediateLosslessGenericRefinementRegion
+            | SegmentType::IntermediateGenericRefinementRegion => {
+                let reference = self
+                    .first_referenced_bitmap(&header.referred_segments)
+                    .cloned();
+                let (params, payload) = refinement::parse_header(data)?;
+                // 参照ビットマップが無ければページからの切り出しが必要だが、
+                // 簡略のため空背景を参照として使う（耐故障）。
+                let ref_bm = reference
+                    .unwrap_or_else(|| Bitmap::new(params.region.width, params.region.height));
+                if let Ok(bm) = refinement::decode_region(&params, &ref_bm, payload) {
+                    if matches!(
+                        header.seg_type,
+                        SegmentType::ImmediateGenericRefinementRegion
+                            | SegmentType::ImmediateLosslessGenericRefinementRegion
+                    ) {
+                        self.compose_to_page(&bm, &params.region);
+                    } else {
+                        self.artifacts
+                            .insert(header.number, SegmentArtifact::Bitmap(bm));
+                    }
+                }
             }
             SegmentType::PatternDictionary
             | SegmentType::IntermediateHalftoneRegion
@@ -203,13 +305,38 @@ impl Driver {
                 // セッション 4 で実装
             }
             SegmentType::Tables => {
-                // セッション 3 で実装（Huffman カスタムテーブル）
+                if let Ok(t) = huffman::parse_custom_table(data) {
+                    self.artifacts
+                        .insert(header.number, SegmentArtifact::Table(t));
+                }
             }
             SegmentType::Profiles | SegmentType::Extension | SegmentType::Unknown(_) => {
                 // 仕様で「未知セグメントは無視可」とされている
             }
         }
         Ok(())
+    }
+
+    /// 領域結果をページに合成する（Symbol/Text/Refinement 共通）。
+    /// `combop` は領域情報の external_combop を使い、必要なら page_info の
+    /// override に従う。
+    fn compose_to_page(&mut self, src: &Bitmap, region: &segment::RegionSegmentInfo) {
+        let op = if let Some(pi) = &self.page_info {
+            if pi.combop_override {
+                generic_region::combine_op_from(pi.default_combop)
+            } else {
+                generic_region::combine_op_from(region.external_combop)
+            }
+        } else {
+            CombineOp::Or
+        };
+        if let Some(page) = self.page.as_mut() {
+            page.combine(src, region.x as i64, region.y as i64, op);
+        }
+        let new_y = (region.y as u64).saturating_add(region.height as u64);
+        if new_y > self.current_stripe_y as u64 {
+            self.current_stripe_y = new_y.min(u32::MAX as u64) as u32;
+        }
     }
 
     /// Generic region セグメントのデータ部を復号してページへ合成する。
@@ -394,6 +521,90 @@ mod tests {
         let out = decode(&s2, None, None).unwrap();
         // stride=2、4 行 → 8 バイト
         assert_eq!(out.len(), 8);
+    }
+
+    /// 空の Symbol Dictionary（num_new=0, num_exp=0）が走破できる。
+    /// テキスト領域から参照されてもエラーにならず、ページは背景のまま。
+    #[test]
+    fn empty_symbol_dictionary_runs() {
+        let s = build_min_stream(16, 4, 0);
+
+        // ---- セグメント番号 3: 空の Symbol Dictionary ----
+        let mut sd_payload = Vec::new();
+        sd_payload.extend_from_slice(&0u16.to_be_bytes()); // flags（arith, template=0）
+        sd_payload.extend_from_slice(&[3, 0xFF, 0xFD, 0xFF, 2, 0xFE, 0xFE, 0xFE]); // SDAT
+        sd_payload.extend_from_slice(&0u32.to_be_bytes()); // num_exp
+        sd_payload.extend_from_slice(&0u32.to_be_bytes()); // num_new
+        sd_payload.extend_from_slice(&[0u8; 8]);
+        sd_payload.extend_from_slice(&[0xFF, 0xAC]);
+
+        let mut sd_seg = Vec::new();
+        sd_seg.extend_from_slice(&3u32.to_be_bytes());
+        sd_seg.push(0); // type=0 SymbolDictionary
+        sd_seg.push(0); // ref count=0
+        sd_seg.push(1); // page assoc
+        sd_seg.extend_from_slice(&(sd_payload.len() as u32).to_be_bytes());
+        sd_seg.extend_from_slice(&sd_payload);
+
+        // EOP の前に挿入
+        let mut s2 = Vec::new();
+        s2.extend_from_slice(&s[..s.len() - 11]);
+        s2.extend_from_slice(&sd_seg);
+        s2.extend_from_slice(&s[s.len() - 11..]);
+
+        let out = decode(&s2, None, None).unwrap();
+        // ページは背景白のまま
+        assert!(out.iter().all(|b| *b == 0xFF));
+    }
+
+    /// Tables セグメント（type=53）は内容が不正でもパースだけ通る（耐故障）。
+    #[test]
+    fn malformed_table_segment_skipped() {
+        let s = build_min_stream(8, 2, 0);
+        let mut tab = Vec::new();
+        tab.extend_from_slice(&3u32.to_be_bytes());
+        tab.push(53); // type=53 Tables
+        tab.push(0);
+        tab.push(1);
+        tab.extend_from_slice(&4u32.to_be_bytes());
+        tab.extend_from_slice(&[0u8; 4]); // 不正テーブル
+        let mut s2 = Vec::new();
+        s2.extend_from_slice(&s[..s.len() - 11]);
+        s2.extend_from_slice(&tab);
+        s2.extend_from_slice(&s[s.len() - 11..]);
+        let _ = decode(&s2, None, None).unwrap();
+    }
+
+    /// Refinement region は参照無しでも空背景を使って走破できる（耐故障）。
+    #[test]
+    fn refinement_region_without_reference_runs() {
+        let s = build_min_stream(8, 4, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&8u32.to_be_bytes()); // width
+        payload.extend_from_slice(&4u32.to_be_bytes()); // height
+        payload.extend_from_slice(&0u32.to_be_bytes()); // x
+        payload.extend_from_slice(&0u32.to_be_bytes()); // y
+        payload.push(0); // region info flags
+        payload.push(0b0000_0001); // template=1, tpgron=0
+        payload.extend_from_slice(&0i32.to_be_bytes()); // GRREFERENCEDX
+        payload.extend_from_slice(&0i32.to_be_bytes()); // GRREFERENCEDY
+        payload.extend_from_slice(&[0u8; 8]);
+        payload.extend_from_slice(&[0xFF, 0xAC]);
+
+        let mut seg = Vec::new();
+        seg.extend_from_slice(&3u32.to_be_bytes());
+        seg.push(42); // immediate refinement
+        seg.push(0);
+        seg.push(1);
+        seg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        seg.extend_from_slice(&payload);
+
+        let mut s2 = Vec::new();
+        s2.extend_from_slice(&s[..s.len() - 11]);
+        s2.extend_from_slice(&seg);
+        s2.extend_from_slice(&s[s.len() - 11..]);
+        let out = decode(&s2, None, None).unwrap();
+        assert_eq!(out.len(), 4);
     }
 
     #[test]
