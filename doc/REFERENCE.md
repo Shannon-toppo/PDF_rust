@@ -446,7 +446,7 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
 ### 対応
 
 - ✅ 読み込み: PDF 1.0–1.7（古典 xref / xref ストリーム / ObjStm / ハイブリッド / 増分更新済みファイル / 破損 xref の再構築）
-- ✅ フィルタ: FlateDecode（+PNG/TIFF predictor）, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode, CCITTFaxDecode（T.4/T.6）
+- ✅ フィルタ: FlateDecode（+PNG/TIFF predictor）, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode, CCITTFaxDecode（T.4/T.6）, JBIG2Decode（T.88 算術経路）
 - ✅ テキスト抽出: 単純フォント（WinAnsi 相当）+ ToUnicode CMap（CID フォント含む）+ Form XObject 再帰
 - ✅ 編集: ページ追加/削除/回転、テキスト・直線・矩形の描画、任意コンテント追記、メタデータ
 - ✅ 生成: ゼロからの文書作成、標準 14 フォント、文書情報、`/ID` 生成
@@ -487,12 +487,19 @@ cargo test          # ユニット 206 + 統合 61 + doctest 3
   と非標準 `/Filter` ハンドラは未対応
 - ❌ CFF アウトライン（`.otf`）— `load_font_from_bytes` が `PdfError::Font` を返す
 - ❌ 縦書き（Identity-V）— 横書き（Identity-H）のみ対応
-- ❌ 画像: progressive JPEG / JPXDecode / JBIG2Decode はデコード不可
+- ❌ 画像: progressive JPEG / JPXDecode はデコード不可
   （レンダリングでは読み飛ばし。生データ取得は可能）
 - ✅ CCITTFaxDecode（T.4 1D / T.4 2D / T.6 MMR）—
   `/K` `Columns` `Rows` `EndOfBlock` `EndOfLine` `EncodedByteAlign`
   `BlackIs1` の各 DecodeParms に対応。スキャン文書の二値画像 XObject /
   ImageMask が描画できる。拡張 1D/2D（uncommon）は明示的に拒否
+- ✅ JBIG2Decode（ITU-T T.88 / ISO 14492）— セグメントヘッダ + Page
+  information + Generic region（算術 + MMR） + Symbol dictionary +
+  Text region + Generic refinement + Pattern dictionary + Halftone
+  region に対応。`/JBIG2Globals` ストリーム（参照可）の解決込み。
+  Huffman 経路の symbol/text region と Halftone の MMR 経路、
+  HENABLESKIP、CFF2 / Type1 charstring は未対応で明示エラーまたは
+  読み飛ばし。出力は PDF 慣習に従い 1=白の 1bpp パックビット
 - ✅ シェーディング（`sh`）— Axial (Type 2) / Radial (Type 3)。
   `/Background` `/BBox` `/Extend` `/Domain` 対応。Type 1（関数ベース）と
   Type 4–7（メッシュ）は未対応で読み飛ばし

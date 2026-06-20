@@ -157,7 +157,7 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
 
 優先順: CFF → 暗号化（空パスワード優先）→ シェーディング → 透明度 → CCITT。
 「手元の実 PDF が表示できない」事例ドリブンで進める。
-現状: CFF・暗号化・シェーディング・透明度・CCITT まで完了（2026-06-19）。
+現状: CFF・暗号化・シェーディング・透明度・CCITT・JBIG2 まで完了（2026-06-20）。
 
 - [x] CFF/Type1 チャーストリング解釈（実世界 PDF の多数派。3,000–5,000 行級）
       — `src/cff.rs`（CFF パーサ + Type 2 解釈器）と `src/cff_strings.rs`
@@ -211,8 +211,9 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
       仕様が極めて大きく（MQ コーダ・generic / text / halftone region・
       symbol dictionary）、本プロジェクトの「依存ゼロ + フルスクラッチ」
       方針では別 Phase に切り出すのが妥当としてここではスコープ外
-- [ ] JBIG2Decode（スキャン文書、`/Filter /JBIG2Decode`）— ITU-T T.88 /
-      ISO 14492。進行中（`src/filters/jbig2/`）。
+- [x] JBIG2Decode（スキャン文書、`/Filter /JBIG2Decode`）— ITU-T T.88 /
+      ISO 14492。算術経路の主要セグメント（Generic / Symbol / Text /
+      Refinement / Pattern / Halftone）に対応（2026-06-20 完了）。
       - セッション 1（2026-06-20、完了）: 基盤
         （`bitmap`/`reader`/`mq`/`huffman`/`segment`/`page`/`mod`）。
         セグメントヘッダのパース + ページ情報セグメント + MQ 算術復号器
@@ -241,8 +242,20 @@ Phase 7（性能・制御）・Phase 8（検索・選択）として本計画に
         （実 PDF では arithmetic がほぼ全て）。検証: ユニット 49 増
         （huffman 7 + refinement 5 + symbol_dict 5 + text_region 4 +
         mod 3: 空シンボル辞書 / 不正テーブル素通り / 参照無し refinement）
-      - セッション 4（未着手）: Pattern dictionary / Halftone region と
-        全ドキュメント同期
+      - セッション 4（2026-06-20、完了）: Pattern dictionary
+        （`pattern_dict.rs`）／ Halftone region（`halftone_region.rs`）。
+        Pattern dictionary は HDMMR/HDTEMPLATE/HDPW/HDPH/GRAYMAX をパースし、
+        全パターンを 1 つの大きな generic region として復号して
+        `pattern_width` ごとに分割（AT pixels = T.88 §6.7.5 の固定値）。
+        Halftone region は HMMR/HTEMPLATE/HENABLESKIP/HCOMBOP/HDEFPIXEL +
+        HGW/HGH/HGX/HGY/HRX/HRY をパースし、算術経路で MSB → LSB の順に
+        `HNUMBITPLANES` 個の generic region を 1 本の MQ ストリームから
+        復号、Gray code でパターンインデックスを再構成して `>> 8` の
+        固定小数点座標で配置する。`SegmentArtifact::Patterns` を追加し、
+        Halftone セグメントが referred_segments で参照する。MMR 経路と
+        HENABLESKIP は未対応エラー（実 PDF の出現が稀）。検証: ユニット
+        17 増（pattern_dict 5 + halftone_region 11 + mod 1: pattern→
+        halftone セグメント連鎖の `decode` 完走）
 - [ ] progressive JPEG（`filters/dct.rs` の拡張。スキャン文書・写真系で遭遇）
 - [ ] `/Mask`（ステンシル・カラーキー）
 - [ ] 縦書き（Identity-V。和文ビューワーとしては将来必要）
