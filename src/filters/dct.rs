@@ -1,10 +1,13 @@
-//! baseline / extended-sequential JPEG（DCTDecode）デコーダのフルスクラッチ実装。
+//! baseline / extended-sequential / progressive JPEG（DCTDecode）デコーダの
+//! フルスクラッチ実装。
 //!
 //! ITU-T T.81 (ISO/IEC 10918-1) のうち、以下に対応する:
 //!
-//! - **SOF0**（baseline DCT, ハフマン, 8bit）と **SOF1**（extended sequential, 8bit）。
-//!   SOF2（progressive）は明示的な [`PdfError::Filter`] を返す（後続フェーズで対応予定）。
-//!   12bit 精度・算術符号化も明示エラー。
+//! - **SOF0**（baseline DCT, ハフマン, 8bit）・**SOF1**（extended sequential, 8bit）・
+//!   **SOF2**（progressive DCT, ハフマン, 8bit）。progressive はスペクトル選択
+//!   （Ss/Se）と逐次近似（Ah/Al）の複数スキャンを係数バッファに蓄積し、全スキャン
+//!   完了後にデクオンタイズ + 逆 DCT する（[`Decoder::finalize_progressive`]）。
+//!   12bit 精度・算術符号化は明示エラー。
 //! - マーカー: SOI / APP0–APP15 / COM / DQT / DHT / DRI / SOS / EOI。
 //!   その他の不明セグメントは長さフィールドで読み飛ばす。
 //! - ハフマン復号（DC/AC を各 4 テーブルまで）。
@@ -263,6 +266,167 @@ fn extend(v: i32, t: u8) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// progressive スキャンの係数復号（T.81 Annex G.1.2）
+//
+// いずれも `block` は 1 ブロック 64 係数（自然順）。ジグザグ index `k` から
+// 自然順への変換は [`ZIGZAG`] で行う。係数は逐次近似の今回ビット位置だけを
+// 立てて蓄積し、デクオンタイズと逆 DCT は全スキャン完了後に行う。
+// ---------------------------------------------------------------------------
+
+/// DC 初回スキャン（Ah==0）。DC 差分を復号し、point transform `al` だけ左シフト
+/// して格納する（T.81 G.1.2.1）。
+fn decode_dc_first(
+    block: &mut [i32],
+    br: &mut BitReader,
+    dc_tab: &HuffmanTable,
+    pred: &mut i32,
+    al: u8,
+) -> Result<()> {
+    let t = dc_tab.decode(br)?;
+    if t > 11 {
+        return Err(err("DC のビット長が不正"));
+    }
+    let diff = extend(br.read_bits(t)?, t);
+    *pred = pred.wrapping_add(diff);
+    block[0] = *pred << al;
+    Ok(())
+}
+
+/// DC 精緻化スキャン（Ah!=0）。1 ビット読み、立っていれば今回ビットを足す。
+fn decode_dc_refine(block: &mut [i32], br: &mut BitReader, al: u8) -> Result<()> {
+    if br.read_bit()? != 0 {
+        block[0] |= 1 << al;
+    }
+    Ok(())
+}
+
+/// AC 初回スキャン（Ah==0）。スペクトル選択 `ss..=se` の係数を復号する。
+/// EOBRUN（end-of-band run）で全ゼロ帯域をまとめて飛ばす（T.81 G.1.2.2）。
+fn decode_ac_first(
+    block: &mut [i32],
+    br: &mut BitReader,
+    ac_tab: &HuffmanTable,
+    ss: usize,
+    se: usize,
+    al: u8,
+    eobrun: &mut u32,
+) -> Result<()> {
+    if *eobrun > 0 {
+        *eobrun -= 1;
+        return Ok(());
+    }
+    let mut k = ss;
+    while k <= se {
+        let rs = ac_tab.decode(br)?;
+        let r = (rs >> 4) as usize;
+        let s = rs & 0x0F;
+        if s != 0 {
+            k += r;
+            if k > se {
+                break;
+            }
+            let val = extend(br.read_bits(s)?, s);
+            if let Some(&nat) = ZIGZAG.get(k) {
+                block[nat] = val << al;
+            }
+            k += 1;
+        } else {
+            if r != 15 {
+                // EOBn: このブロックを含め 2^r + 付加ビット ブロックが帯域内全ゼロ。
+                // 現在ブロックは復号済みで break するため、後続ブロック数（= 全体 - 1）を
+                // EOBRUN に積む（次回以降の呼び出し冒頭で 1 つずつ減算する）。
+                *eobrun = (1u32 << r) - 1;
+                if r != 0 {
+                    *eobrun += br.read_bits(r as u8)? as u32;
+                }
+                break;
+            }
+            // ZRL: 16 個のゼロを飛ばす。
+            k += 16;
+        }
+    }
+    Ok(())
+}
+
+/// AC 精緻化スキャン（Ah!=0）。既存の非ゼロ係数に補正ビットを足しつつ、
+/// 新たに非ゼロになる係数を符号ビットで配置する（T.81 G.1.2.3）。
+fn decode_ac_refine(
+    block: &mut [i32],
+    br: &mut BitReader,
+    ac_tab: &HuffmanTable,
+    ss: usize,
+    se: usize,
+    al: u8,
+    eobrun: &mut u32,
+) -> Result<()> {
+    let p1: i32 = 1 << al; // 今回ビット位置の +1
+    let m1: i32 = -1i32 << al; // 今回ビット位置の -1
+    let mut k = ss;
+
+    if *eobrun == 0 {
+        while k <= se {
+            let rs = ac_tab.decode(br)?;
+            let mut r = (rs >> 4) as i32;
+            let s = rs & 0x0F;
+            // 新規非ゼロ係数の値（0 = この符号では新規係数なし）。
+            let mut newval: i32 = 0;
+            if s != 0 {
+                // s は 1 のはず。符号ビットを読む。
+                newval = if br.read_bit()? != 0 { p1 } else { m1 };
+            } else if r != 15 {
+                // EOBn: 帯域終端ランへ。
+                *eobrun = 1u32 << r;
+                if r != 0 {
+                    *eobrun += br.read_bits(r as u8)? as u32;
+                }
+                break;
+            }
+            // r 個のゼロ係数を飛ばしつつ、途中の非ゼロ係数を精緻化する。
+            while k <= se {
+                let nat = match ZIGZAG.get(k) {
+                    Some(&n) => n,
+                    None => break,
+                };
+                if block[nat] != 0 {
+                    if br.read_bit()? != 0 && (block[nat] & p1) == 0 {
+                        block[nat] += if block[nat] >= 0 { p1 } else { m1 };
+                    }
+                } else {
+                    if r == 0 {
+                        break;
+                    }
+                    r -= 1;
+                }
+                k += 1;
+            }
+            // 新規非ゼロ係数を現在位置に配置する。
+            if newval != 0 {
+                if let Some(&nat) = ZIGZAG.get(k) {
+                    if k <= se {
+                        block[nat] = newval;
+                    }
+                }
+            }
+            k += 1;
+        }
+    }
+
+    // 帯域終端ラン中: 残り係数の非ゼロを精緻化し、ラン数を 1 減らす。
+    if *eobrun > 0 {
+        while k <= se {
+            if let Some(&nat) = ZIGZAG.get(k) {
+                if block[nat] != 0 && br.read_bit()? != 0 && (block[nat] & p1) == 0 {
+                    block[nat] += if block[nat] >= 0 { p1 } else { m1 };
+                }
+            }
+            k += 1;
+        }
+        *eobrun -= 1;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 逆 DCT
 // ---------------------------------------------------------------------------
 
@@ -364,6 +528,9 @@ struct Component {
     plane: Vec<u8>,
     /// 平面の確保幅（= blocks_per_line * 8）。
     stride: usize,
+    /// progressive 用の係数バッファ（`blocks_per_line * blocks_per_col * 64`、
+    /// 1 ブロック 64 係数を自然順で保持）。baseline では未使用（空）。
+    coeffs: Vec<i32>,
 }
 
 /// スキャンごとのコンポーネント割り当て。
@@ -410,6 +577,12 @@ struct Decoder<'a> {
     /// APP14 セグメントが存在したか（CMYK 反転判定に使う）。
     has_adobe: bool,
     sof_seen: bool,
+    /// SOF2（progressive）か。true なら複数スキャンを係数バッファへ蓄積する。
+    progressive: bool,
+    /// progressive の係数バッファを確保済みか。
+    coeffs_ready: bool,
+    /// これまでに復号した SOS スキャン数（耐故障の終了判定に使う）。
+    scan_count: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -428,6 +601,9 @@ impl<'a> Decoder<'a> {
             adobe_transform: None,
             has_adobe: false,
             sof_seen: false,
+            progressive: false,
+            coeffs_ready: false,
+            scan_count: 0,
         }
     }
 
@@ -452,15 +628,26 @@ impl<'a> Decoder<'a> {
         self.pos = 2;
 
         loop {
-            // 次のマーカーを探す（0xFF が連続することがある）
-            let marker = self.next_marker()?;
+            // 次のマーカーを探す（0xFF が連続することがある）。progressive で
+            // 全スキャンを読み終えた後に EOI 欠落で終端した場合は、エラーにせず
+            // ここまでの係数で組み立てる（耐故障）。
+            let marker = match self.next_marker() {
+                Ok(m) => m,
+                Err(e) => {
+                    if self.sof_seen && self.scan_count > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
+            };
             match marker {
                 0xD9 => break, // EOI
                 0xC0 | 0xC1 => {
                     self.read_sof(marker)?;
                 }
                 0xC2 => {
-                    return Err(err("progressive JPEG (SOF2) は未対応"));
+                    // SOF2: progressive
+                    self.read_sof(marker)?;
                 }
                 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
                     return Err(err(
@@ -474,8 +661,11 @@ impl<'a> Decoder<'a> {
                 0xDA => {
                     // SOS: スキャンを復号する
                     self.read_sos()?;
-                    // baseline は単一スキャン。SOS 後に EOI が来るまでで完了。
-                    break;
+                    // baseline は単一スキャン。progressive は複数スキャンを
+                    // 読み続け、EOI（または終端）まで継続する。
+                    if !self.progressive {
+                        break;
+                    }
                 }
                 0x01 | 0xD0..=0xD7 => {
                     // TEM / RST はパラメータなし（ここでは無視）
@@ -489,6 +679,14 @@ impl<'a> Decoder<'a> {
 
         if !self.sof_seen {
             return Err(err("SOF マーカーが見つからない"));
+        }
+
+        if self.progressive {
+            // progressive は全スキャン蓄積後にデクオンタイズ + 逆 DCT する。
+            if !self.coeffs_ready {
+                return Err(err("progressive にスキャンがない"));
+            }
+            self.finalize_progressive()?;
         }
 
         self.assemble()
@@ -526,8 +724,9 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    /// SOF0 / SOF1 を読む。
-    fn read_sof(&mut self, _marker: u8) -> Result<()> {
+    /// SOF0 / SOF1 / SOF2 を読む。SOF2 は progressive。
+    fn read_sof(&mut self, marker: u8) -> Result<()> {
+        self.progressive = marker == 0xC2;
         let start = self.pos;
         let len = self.u16_be(start)?;
         let prec = self.u8_at(start + 2)?;
@@ -572,6 +771,7 @@ impl<'a> Decoder<'a> {
                 blocks_per_col: 0,
                 plane: Vec::new(),
                 stride: 0,
+                coeffs: Vec::new(),
             });
             p += 3;
         }
@@ -725,10 +925,35 @@ impl<'a> Decoder<'a> {
                 .ok_or_else(|| err("SOS が未知の成分を参照"))?;
             scan_comps.push(ScanComponent { comp_index, td, ta });
         }
-        // Ss, Se, Ah/Al（baseline では 0,63,0,0 のはず。無視して進む）
+        // Ss, Se, Ah/Al。baseline では 0,63,0,0。progressive ではスキャンごとに
+        // スペクトル選択（Ss..Se）と逐次近似のビット位置（Ah=前回, Al=今回）を持つ。
+        let ss = self.u8_at(p)? as usize;
+        let se = self.u8_at(p + 1)? as usize;
+        let ahal = self.u8_at(p + 2)?;
+        let ah = ahal >> 4;
+        let al = ahal & 0x0F;
         self.pos = start + len;
 
-        self.decode_scan(&scan_comps)
+        if self.progressive {
+            if se > 63 || ss > se || ah > 13 || al > 13 {
+                return Err(err("progressive の SOS パラメータが不正"));
+            }
+            // DC スキャン（Ss==0）は複数成分インターリーブ可、AC スキャン（Ss>0）は
+            // 単一成分のみ（T.81 G.1）。
+            if ss > 0 && scan_comps.len() != 1 {
+                return Err(err(
+                    "progressive の AC スキャンは単一成分でなければならない",
+                ));
+            }
+            self.prepare_progressive()?;
+            self.decode_progressive_scan(&scan_comps, ss, se, ah, al)?;
+            self.scan_count += 1;
+            Ok(())
+        } else {
+            self.decode_scan(&scan_comps)?;
+            self.scan_count += 1;
+            Ok(())
+        }
     }
 
     /// インターリーブされた MCU 列を復号して各成分の平面を埋める。
@@ -814,6 +1039,16 @@ impl<'a> Decoder<'a> {
 
     /// リスタートマーカー（RSTn）を処理する: バイト境界に揃え、DC 予測子をリセット。
     fn handle_restart(&self, br: &mut BitReader, pred: &mut [i32]) -> Result<()> {
+        self.skip_restart(br);
+        for v in pred.iter_mut() {
+            *v = 0;
+        }
+        Ok(())
+    }
+
+    /// ビットリーダをバイト境界に揃え、次の RSTn マーカーを読み飛ばす。
+    /// DC 予測子や EOBRUN のリセットは呼び出し側の責務（progressive と共有）。
+    fn skip_restart(&self, br: &mut BitReader) {
         br.reset_to_byte();
         // br.pos から次の 0xFF Dn マーカーを読み飛ばす
         let data = br.data;
@@ -844,10 +1079,6 @@ impl<'a> Decoder<'a> {
         br.marker = 0;
         br.bit_buf = 0;
         br.bit_count = 0;
-        for v in pred.iter_mut() {
-            *v = 0;
-        }
-        Ok(())
     }
 
     /// 1 ブロック（8x8）を復号してデクオンタイズした係数（自然順）を返す。
@@ -915,6 +1146,231 @@ impl<'a> Decoder<'a> {
         // デクオンタイズ（自然順同士の乗算）
         for i in 0..64 {
             out[i] = (coef[i] as f32) * (qt[i] as f32);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // progressive 経路
+    // -----------------------------------------------------------------------
+
+    /// progressive の係数バッファを確保する（最初の SOS で 1 回だけ）。
+    ///
+    /// 各成分のブロック格子は baseline と同じ MCU 整列（`blocks_per_line =
+    /// mcus_x * h`）で確保する。非インターリーブスキャンはこの格子の一部だけを
+    /// 走査する。
+    fn prepare_progressive(&mut self) -> Result<()> {
+        if self.coeffs_ready {
+            return Ok(());
+        }
+        let hmax = self.components.iter().map(|c| c.h).max().unwrap_or(1) as usize;
+        let vmax = self.components.iter().map(|c| c.v).max().unwrap_or(1) as usize;
+        let mcus_x = self.frame_width.div_ceil(8 * hmax);
+        let mcus_y = self.frame_height.div_ceil(8 * vmax);
+        for c in self.components.iter_mut() {
+            c.blocks_per_line = mcus_x * c.h as usize;
+            c.blocks_per_col = mcus_y * c.v as usize;
+            c.stride = c.blocks_per_line * 8;
+            let nblocks = c
+                .blocks_per_line
+                .checked_mul(c.blocks_per_col)
+                .ok_or_else(|| err("ブロック数オーバーフロー"))?;
+            let total = nblocks
+                .checked_mul(64)
+                .ok_or_else(|| err("係数バッファサイズオーバーフロー"))?;
+            if total as u64 > MAX_PIXELS.saturating_mul(4) {
+                return Err(err("progressive の係数バッファが大きすぎる"));
+            }
+            c.coeffs = vec![0i32; total];
+        }
+        self.coeffs_ready = true;
+        Ok(())
+    }
+
+    /// progressive のスキャンを 1 つ復号し、係数バッファを更新する。
+    ///
+    /// - `ss`/`se`: スペクトル選択（係数のジグザグ範囲）。`ss==0` は DC スキャン。
+    /// - `ah`/`al`: 逐次近似。`ah==0` が初回スキャン、`ah!=0` が精緻化スキャン。
+    fn decode_progressive_scan(
+        &mut self,
+        scan: &[ScanComponent],
+        ss: usize,
+        se: usize,
+        ah: u8,
+        al: u8,
+    ) -> Result<()> {
+        // 借用競合回避のため、必要なハフマンテーブルを先にクローンする。
+        let dc_tabs: Vec<Option<HuffmanTable>> = scan
+            .iter()
+            .map(|sc| self.huff_dc.get(sc.td).and_then(|t| t.clone()))
+            .collect();
+        let ac_tabs: Vec<Option<HuffmanTable>> = scan
+            .iter()
+            .map(|sc| self.huff_ac.get(sc.ta).and_then(|t| t.clone()))
+            .collect();
+
+        let mut br = BitReader::new(self.data, self.pos);
+        let interval = self.restart_interval;
+
+        if scan.len() > 1 {
+            // インターリーブ（DC のみ）。MCU 単位で各成分の h*v ブロックを走査。
+            let hmax = self.components.iter().map(|c| c.h).max().unwrap_or(1) as usize;
+            let vmax = self.components.iter().map(|c| c.v).max().unwrap_or(1) as usize;
+            let mcus_x = self.frame_width.div_ceil(8 * hmax);
+            let mcus_y = self.frame_height.div_ceil(8 * vmax);
+            let mut pred = vec![0i32; self.components.len()];
+            let mut mcu_count = 0usize;
+
+            for my in 0..mcus_y {
+                for mx in 0..mcus_x {
+                    if interval != 0 && mcu_count != 0 && mcu_count.is_multiple_of(interval) {
+                        self.skip_restart(&mut br);
+                        for v in pred.iter_mut() {
+                            *v = 0;
+                        }
+                    }
+                    for (si, sc) in scan.iter().enumerate() {
+                        let ci = sc.comp_index;
+                        let (h, v, bpl) = {
+                            let c = &self.components[ci];
+                            (c.h as usize, c.v as usize, c.blocks_per_line)
+                        };
+                        for by in 0..v {
+                            for bx in 0..h {
+                                let blk_x = mx * h + bx;
+                                let blk_y = my * v + by;
+                                let idx = (blk_y * bpl + blk_x) * 64;
+                                let block = match self.components[ci].coeffs.get_mut(idx..idx + 64)
+                                {
+                                    Some(b) => b,
+                                    None => continue,
+                                };
+                                if ah == 0 {
+                                    let dc = dc_tabs[si]
+                                        .as_ref()
+                                        .ok_or_else(|| err("DC ハフマンテーブルが未定義"))?;
+                                    decode_dc_first(block, &mut br, dc, &mut pred[ci], al)?;
+                                } else {
+                                    decode_dc_refine(block, &mut br, al)?;
+                                }
+                            }
+                        }
+                    }
+                    mcu_count += 1;
+                }
+            }
+        } else {
+            // 非インターリーブ（単一成分）。成分自身のブロック格子を走査する。
+            let sc = &scan[0];
+            let ci = sc.comp_index;
+            let hmax = self.components.iter().map(|c| c.h).max().unwrap_or(1) as usize;
+            let vmax = self.components.iter().map(|c| c.v).max().unwrap_or(1) as usize;
+            let (h, v, bpl) = {
+                let c = &self.components[ci];
+                (c.h as usize, c.v as usize, c.blocks_per_line)
+            };
+            // 非インターリーブのブロック数 = ceil(成分サンプル数 / 8)。
+            let comp_w = (self.frame_width * h).div_ceil(hmax);
+            let comp_h = (self.frame_height * v).div_ceil(vmax);
+            let ni_bpl = comp_w.div_ceil(8);
+            let ni_bpc = comp_h.div_ceil(8);
+
+            let dc_tab = dc_tabs[0].clone();
+            let ac_tab = ac_tabs[0].clone();
+            let mut pred = 0i32;
+            let mut eobrun = 0u32;
+            let mut count = 0usize;
+
+            for by in 0..ni_bpc {
+                for bx in 0..ni_bpl {
+                    if interval != 0 && count != 0 && count.is_multiple_of(interval) {
+                        self.skip_restart(&mut br);
+                        pred = 0;
+                        eobrun = 0;
+                    }
+                    let idx = (by * bpl + bx) * 64;
+                    let block = match self.components[ci].coeffs.get_mut(idx..idx + 64) {
+                        Some(b) => b,
+                        None => {
+                            count += 1;
+                            continue;
+                        }
+                    };
+                    if ss == 0 {
+                        // DC スキャン
+                        if ah == 0 {
+                            let dc = dc_tab
+                                .as_ref()
+                                .ok_or_else(|| err("DC ハフマンテーブルが未定義"))?;
+                            decode_dc_first(block, &mut br, dc, &mut pred, al)?;
+                        } else {
+                            decode_dc_refine(block, &mut br, al)?;
+                        }
+                    } else {
+                        // AC スキャン
+                        let ac = ac_tab
+                            .as_ref()
+                            .ok_or_else(|| err("AC ハフマンテーブルが未定義"))?;
+                        if ah == 0 {
+                            decode_ac_first(block, &mut br, ac, ss, se, al, &mut eobrun)?;
+                        } else {
+                            decode_ac_refine(block, &mut br, ac, ss, se, al, &mut eobrun)?;
+                        }
+                    }
+                    count += 1;
+                }
+            }
+        }
+
+        self.pos = br.pos;
+        Ok(())
+    }
+
+    /// 全 progressive スキャン完了後、係数バッファをデクオンタイズ + 逆 DCT して
+    /// 各成分の平面を埋める。
+    fn finalize_progressive(&mut self) -> Result<()> {
+        for ci in 0..self.components.len() {
+            let tq = self.components[ci].tq as usize;
+            let qt = self
+                .qtables
+                .get(tq)
+                .and_then(|t| *t)
+                .ok_or_else(|| err("参照された量子化テーブルが未定義"))?;
+            let (bpl, bpc, stride) = {
+                let c = &self.components[ci];
+                (c.blocks_per_line, c.blocks_per_col, c.stride)
+            };
+            let plane_h = bpc * 8;
+            let total = stride
+                .checked_mul(plane_h)
+                .ok_or_else(|| err("成分平面サイズオーバーフロー"))?;
+            let mut plane = vec![0u8; total];
+            for by in 0..bpc {
+                for bx in 0..bpl {
+                    let idx = (by * bpl + bx) * 64;
+                    let mut block = [0f32; 64];
+                    {
+                        let coeffs = &self.components[ci].coeffs;
+                        for (i, slot) in block.iter_mut().enumerate() {
+                            let c = coeffs.get(idx + i).copied().unwrap_or(0);
+                            *slot = (c as f32) * (qt[i] as f32);
+                        }
+                    }
+                    let pixels = idct_8x8(&block);
+                    let ox = bx * 8;
+                    let oy = by * 8;
+                    for yy in 0..8 {
+                        let row = oy + yy;
+                        let base = row * stride + ox;
+                        for xx in 0..8 {
+                            if let Some(dst) = plane.get_mut(base + xx) {
+                                *dst = pixels[yy * 8 + xx];
+                            }
+                        }
+                    }
+                }
+            }
+            self.components[ci].plane = plane;
         }
         Ok(())
     }
@@ -1244,6 +1700,96 @@ mod tests {
         dec.color_transform(&mut data, 4);
         // 反転後 = 255 - v
         assert_eq!(data, vec![245, 235, 225, 215]);
+    }
+
+    #[test]
+    fn prog_dc_first_and_refine() {
+        // DC 初回: カテゴリ 3（符号長 1 のコード "0"）→ 3bit "101"=5、extend(5,3)=5。
+        // al=1 なので block[0] = pred(5) << 1 = 10。
+        let mut counts = [0u8; 16];
+        counts[0] = 1; // 符号長 1 のコード 1 個
+        let tab = HuffmanTable::build(&counts, vec![3]);
+        let data = [0b0101_0000u8]; // "0"(=cat3) + "101"(=5)
+        let mut br = BitReader::new(&data, 0);
+        let mut block = [0i32; 64];
+        let mut pred = 0i32;
+        decode_dc_first(&mut block, &mut br, &tab, &mut pred, 1).unwrap();
+        assert_eq!(pred, 5);
+        assert_eq!(block[0], 10);
+
+        // DC 精緻化: ビット 1 → al=2 なので +4。
+        let data = [0b1000_0000u8];
+        let mut br = BitReader::new(&data, 0);
+        decode_dc_refine(&mut block, &mut br, 2).unwrap();
+        assert_eq!(block[0], 14);
+    }
+
+    #[test]
+    fn prog_ac_first_eobrun_off_by_one() {
+        // AC テーブル: "00"->0x00（EOB0）, "01"->0x10（EOB, r=1）。
+        let mut counts = [0u8; 16];
+        counts[1] = 2; // 符号長 2 のコード 2 個
+        let tab = HuffmanTable::build(&counts, vec![0x00, 0x10]);
+
+        // EOB0（"00"）: 現在ブロックのみ帯域終端 → 後続スキップは 0。
+        let data = [0b0000_0000u8];
+        let mut br = BitReader::new(&data, 0);
+        let mut block = [0i32; 64];
+        let mut eobrun = 0u32;
+        decode_ac_first(&mut block, &mut br, &tab, 1, 63, 0, &mut eobrun).unwrap();
+        assert_eq!(eobrun, 0, "EOB0 は後続 0 ブロック");
+
+        // EOB（r=1, "01"）+ 付加 1bit "1": eobrun = (1<<1)-1 + 1 = 2。
+        let data = [0b0110_0000u8]; // "01" + "1"
+        let mut br = BitReader::new(&data, 0);
+        let mut eobrun = 0u32;
+        decode_ac_first(&mut block, &mut br, &tab, 1, 63, 0, &mut eobrun).unwrap();
+        assert_eq!(eobrun, 2, "EOB1+1bit は後続 2 ブロック");
+
+        // eobrun>0 の状態で呼ぶと 1 減らして即 return（ビット消費なし）。
+        let data = [0b1111_1111u8];
+        let mut br = BitReader::new(&data, 0);
+        let pos0 = br.pos;
+        let mut eobrun = 3u32;
+        decode_ac_first(&mut block, &mut br, &tab, 1, 63, 0, &mut eobrun).unwrap();
+        assert_eq!(eobrun, 2);
+        assert_eq!(br.pos, pos0, "スキップ中はビットを読まない");
+    }
+
+    #[test]
+    fn prog_ac_first_places_coefficient() {
+        // "0"->0x21（r=2, s=1）: 2 ゼロ飛ばして位置 ss+2 に係数を置く。
+        let mut counts = [0u8; 16];
+        counts[0] = 1;
+        let tab = HuffmanTable::build(&counts, vec![0x21]);
+        // "0"(=0x21) + s=1 の値ビット "1"(=1, extend(1,1)=1)。al=2 → 1<<2=4。
+        let data = [0b0100_0000u8];
+        let mut br = BitReader::new(&data, 0);
+        let mut block = [0i32; 64];
+        let mut eobrun = 0u32;
+        decode_ac_first(&mut block, &mut br, &tab, 1, 63, 2, &mut eobrun).unwrap();
+        // ss=1 から r=2 個飛ばし → ジグザグ index 3 に配置。
+        let nat = ZIGZAG[3];
+        assert_eq!(block[nat], 4);
+        assert_eq!(eobrun, 0);
+    }
+
+    #[test]
+    fn prog_ac_refine_correction_bit() {
+        // 既存の非ゼロ係数に補正ビットを足す（EOB 経路）。
+        let mut counts = [0u8; 16];
+        counts[1] = 2;
+        let tab = HuffmanTable::build(&counts, vec![0x00, 0x10]);
+        let mut block = [0i32; 64];
+        let nat = ZIGZAG[1];
+        block[nat] = 2; // 前スキャンで立った正の係数
+                        // "00"(=EOB0) + 補正ビット "1"。al=0 → p1=1。2 は (2 & 1)==0 かつ正 → +1 = 3。
+        let data = [0b0010_0000u8];
+        let mut br = BitReader::new(&data, 0);
+        let mut eobrun = 0u32;
+        decode_ac_refine(&mut block, &mut br, &tab, 1, 63, 0, &mut eobrun).unwrap();
+        assert_eq!(block[nat], 3);
+        assert_eq!(eobrun, 0);
     }
 
     #[test]
