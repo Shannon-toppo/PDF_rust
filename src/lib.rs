@@ -68,9 +68,11 @@
 //! - 保存は常に完全書き直し（増分更新・電子署名の保持は不可）
 //! - テキスト抽出は ToUnicode CMap か WinAnsi 相当の単純フォントが対象。
 //!   ToUnicode を持たない CID フォントや `/Differences` は近似になる
-//! - 画像コーデックのうち JPEG（DCTDecode baseline）と CCITTFaxDecode
-//!   （T.4 1D / T.4 2D / T.6 MMR）はデコード対応。JPX/JBIG2 と
-//!   progressive JPEG は未対応（生データの取得は可能）
+//! - 画像コーデックのうち JPEG（DCTDecode baseline）・CCITTFaxDecode
+//!   （T.4 1D / T.4 2D / T.6 MMR）・JBIG2Decode（T.88 算術経路:
+//!   Generic / Symbol / Text / Refinement / Pattern / Halftone）は
+//!   デコード対応。JPX と progressive JPEG は未対応
+//!   （生データの取得は可能）
 //! - レンダリングは画像 XObject・インライン画像（BitsPerComponent 1/2/4/8/16、
 //!   /Decode、ImageMask、SMask、各種色空間、baseline JPEG）と注釈の外観
 //!   ストリーム（/AP /N）、シェーディング（axial/radial）・タイリングパターン、

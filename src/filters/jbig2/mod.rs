@@ -14,27 +14,30 @@
 //! **PDF 慣習に従い 1 = 白、0 = 黒**（DeviceGray の既定 `/Decode = [0 1]` と整合）。
 //! JBIG2 内部の「1 = 前景（黒）」とは反転している。反転は本モジュールの最終段で行う。
 //!
-//! ## サポート状況（セッション 2 まで）
+//! ## サポート状況
 //!
 //! - セグメントヘッダのパース／ページ情報セグメントの処理：完備
 //! - Generic region（算術 + MMR）: 完備
 //!   ([`generic_region`])。GBTEMPLATE 0/1/2/3 + AT pixels + TPGDON、
 //!   MMR は [`ccitt::decode`][crate::filters::ccitt::decode] を流用
-//! - Symbol dictionary / Text region / Generic refinement: セッション 3
-//! - Pattern dictionary / Halftone region: セッション 4
+//! - Symbol dictionary / Text region / Generic refinement: 算術経路に対応
+//!   ([`symbol_dict`] / [`text_region`] / [`refinement`])
+//! - Pattern dictionary / Halftone region: 算術経路に対応
+//!   ([`pattern_dict`] / [`halftone_region`])。Halftone の MMR 経路は
+//!   ストリーム境界の特定コストが高いため未対応エラー
 //!
-//! 未対応セグメント種別は黙って読み飛ばす（耐故障路）。Intermediate generic
-//! region はセッション 3 の symbol dictionary 連携用なので、現段階では
-//! デコードだけ試みて結果を捨てる。
+//! 未対応セグメント種別は黙って読み飛ばす（耐故障路）。
 
 use crate::error::{PdfError, Result};
 use crate::object::{Dictionary, Object};
 
 pub mod bitmap;
 pub mod generic_region;
+pub mod halftone_region;
 pub mod huffman;
 pub mod mq;
 pub mod page;
+pub mod pattern_dict;
 pub mod reader;
 pub mod refinement;
 pub mod segment;
@@ -116,6 +119,8 @@ enum SegmentArtifact {
     Symbols(Vec<Bitmap>),
     /// Intermediate generic / refinement で得られた中間ビットマップ
     Bitmap(Bitmap),
+    /// Pattern dictionary が公開したパターン列（Halftone region から参照される）
+    Patterns(Vec<Bitmap>),
     /// Tables セグメントから組み立てたカスタム Huffman テーブル
     #[allow(dead_code)]
     Table(HuffmanTable),
@@ -162,6 +167,17 @@ impl Driver {
             }
         }
         None
+    }
+
+    /// 参照先 Pattern dictionary を最初の 1 件だけ取り出す。
+    /// （Halftone region は仕様上 1 件の pattern dictionary のみ参照する）
+    fn first_referenced_patterns(&self, refs: &[u32]) -> Vec<Bitmap> {
+        for r in refs {
+            if let Some(SegmentArtifact::Patterns(p)) = self.artifacts.get(r) {
+                return p.clone();
+            }
+        }
+        Vec::new()
     }
 
     fn process_stream(&mut self, data: &[u8]) -> Result<()> {
@@ -298,11 +314,35 @@ impl Driver {
                     }
                 }
             }
-            SegmentType::PatternDictionary
-            | SegmentType::IntermediateHalftoneRegion
-            | SegmentType::ImmediateHalftoneRegion
-            | SegmentType::ImmediateLosslessHalftoneRegion => {
-                // セッション 4 で実装
+            SegmentType::PatternDictionary => {
+                if let Ok((params, payload)) = pattern_dict::parse_header(data) {
+                    let patterns = pattern_dict::decode(&params, payload).unwrap_or_default();
+                    self.artifacts
+                        .insert(header.number, SegmentArtifact::Patterns(patterns));
+                }
+            }
+            SegmentType::ImmediateHalftoneRegion
+            | SegmentType::ImmediateLosslessHalftoneRegion
+            | SegmentType::IntermediateHalftoneRegion => {
+                let patterns = self.first_referenced_patterns(&header.referred_segments);
+                let (params, payload) = halftone_region::parse_header(data)?;
+                match halftone_region::decode(&params, payload, &patterns) {
+                    Ok(bm) => {
+                        if matches!(
+                            header.seg_type,
+                            SegmentType::ImmediateHalftoneRegion
+                                | SegmentType::ImmediateLosslessHalftoneRegion
+                        ) {
+                            self.compose_to_page(&bm, &params.region);
+                        } else {
+                            self.artifacts
+                                .insert(header.number, SegmentArtifact::Bitmap(bm));
+                        }
+                    }
+                    Err(_) => {
+                        // 耐故障: 無視して次のセグメントへ
+                    }
+                }
             }
             SegmentType::Tables => {
                 if let Ok(t) = huffman::parse_custom_table(data) {
@@ -605,6 +645,79 @@ mod tests {
         s2.extend_from_slice(&s[s.len() - 11..]);
         let out = decode(&s2, None, None).unwrap();
         assert_eq!(out.len(), 4);
+    }
+
+    /// Pattern dictionary + Immediate halftone region のセグメント連鎖を
+    /// `decode` まで通せること。
+    ///
+    /// 構築物: 16x8 ページに、4x4 の単一パターン（gray_max=0）を
+    /// 4x2 のグリッドで密に並べた halftone。OR 合成で前景一色 →
+    /// 反転後すべて 0x00（黒）になる。
+    #[test]
+    fn pattern_dict_and_halftone_combine() {
+        let mut s = build_min_stream(16, 8, 0);
+
+        // ---- セグメント 3: Pattern dictionary（MMR=1, GRAYMAX=0 → 1 パターン）----
+        // MMR 経路は payload を T.6 として復号するが、行数 0/サイズも 0 のときは
+        // 入力消費なしで終了する。ここでは pw=4 ph=4 / 1 パターンの最小構成を
+        // 使うために、MMR ではなく算術経路にする。Pattern を 1 個だけ作って
+        // halftone 側で bits_per_value=0 にする。
+        // ただし算術 1 パターンでも復号は走り、結果が「すべて黒」になる保証はない。
+        // テストは構造（連鎖の完走 + ページが書き戻された）に絞る。
+        let mut pd_payload = Vec::new();
+        pd_payload.push(0b0000_0000); // HDMMR=0, HDTEMPLATE=0
+        pd_payload.push(4); // HDPW
+        pd_payload.push(4); // HDPH
+        pd_payload.extend_from_slice(&0u32.to_be_bytes()); // GRAYMAX=0
+        pd_payload.extend_from_slice(&[0u8; 8]);
+        pd_payload.extend_from_slice(&[0xFF, 0xAC]);
+        let mut pd_seg = Vec::new();
+        pd_seg.extend_from_slice(&3u32.to_be_bytes());
+        pd_seg.push(16); // type=16 PatternDictionary
+        pd_seg.push(0); // ref count
+        pd_seg.push(1); // page assoc
+        pd_seg.extend_from_slice(&(pd_payload.len() as u32).to_be_bytes());
+        pd_seg.extend_from_slice(&pd_payload);
+
+        // ---- セグメント 4: Immediate halftone region（type=22）----
+        // 16x8 領域、4x2 グリッド、HRX=4*256, HRY=0、参照 = #3
+        let mut ht_payload = Vec::new();
+        // 領域情報フィールド
+        ht_payload.extend_from_slice(&16u32.to_be_bytes()); // width
+        ht_payload.extend_from_slice(&8u32.to_be_bytes()); // height
+        ht_payload.extend_from_slice(&0u32.to_be_bytes()); // x
+        ht_payload.extend_from_slice(&0u32.to_be_bytes()); // y
+        ht_payload.push(0); // combop=0
+                            // halftone flags: HMMR=0, HTEMPLATE=0, skip=0, HCOMBOP=0, HDEFPIXEL=0
+        ht_payload.push(0);
+        ht_payload.extend_from_slice(&4u32.to_be_bytes()); // HGW
+        ht_payload.extend_from_slice(&2u32.to_be_bytes()); // HGH
+        ht_payload.extend_from_slice(&0i32.to_be_bytes()); // HGX
+        ht_payload.extend_from_slice(&0i32.to_be_bytes()); // HGY
+        ht_payload.extend_from_slice(&(4i16 * 256).to_be_bytes()); // HRX
+        ht_payload.extend_from_slice(&0i16.to_be_bytes()); // HRY
+
+        let mut ht_seg = Vec::new();
+        ht_seg.extend_from_slice(&4u32.to_be_bytes());
+        ht_seg.push(22); // type=22 ImmediateHalftoneRegion
+        ht_seg.push(0b001_00000); // 短形式 count=1 → 上位 3 ビット = 001
+        ht_seg.push(3); // 参照番号 = 3（pattern dictionary）
+        ht_seg.push(1); // page assoc
+        ht_seg.extend_from_slice(&(ht_payload.len() as u32).to_be_bytes());
+        ht_seg.extend_from_slice(&ht_payload);
+
+        let mut s2 = Vec::new();
+        s2.extend_from_slice(&s[..s.len() - 11]); // pageinfo
+        s2.extend_from_slice(&pd_seg);
+        s2.extend_from_slice(&ht_seg);
+        s2.extend_from_slice(&s[s.len() - 11..]); // eop
+        s = s2;
+
+        // 復号: 1 パターン (bits_per_value=0) なので算術ストリームは消費されず、
+        // 8 グリッド点に同じパターンを OR で配置する → 部分的にビットが立つ。
+        // 最低限、復号が完走し既定行ストライドの出力が返ることを検証。
+        let out = decode(&s, None, None).unwrap();
+        assert_eq!(out.len(), 16); // stride=2, h=8
     }
 
     #[test]

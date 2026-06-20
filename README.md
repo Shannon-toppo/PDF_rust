@@ -77,10 +77,11 @@ cargo doc --open                                  # API ドキュメント
   OTTO sfnt の `CFF ` テーブルと PDF `/FontFile3`（`OpenType` / `Type1C` /
   `CIDFontType0C`）を Type 2 チャーストリング解釈器で描画できる
 - 縦書き（Identity-V）は未対応
-- レンダリングは progressive JPEG / JPX / JBIG2 の画像、
-  メッシュ系シェーディング (Type 1/4–7) が未対応。CCITTFaxDecode
-  (T.4 1D/2D・T.6 MMR) は描画対応
-  （読み飛ばして描画継続）。Axial/Radial シェーディング (Type 2/3)・
+- レンダリングは progressive JPEG / JPX が未対応、
+  メッシュ系シェーディング (Type 1/4–7) も未対応
+  （読み飛ばして描画継続）。CCITTFaxDecode (T.4 1D/2D・T.6 MMR) と
+  JBIG2Decode（Generic / Symbol / Text / Refinement / Pattern / Halftone
+  の各セグメント。算術経路）、Axial/Radial シェーディング (Type 2/3)・
   Tiling/Shading パターン・透明度（ExtGState `/ca`/`/CA`、ブレンドモード、
   Form XObject の透明グループ）に対応
 
